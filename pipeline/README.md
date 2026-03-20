@@ -132,5 +132,32 @@ venv/bin/python pipeline/transform/metrics.py --dry-run               # preview 
 | `--commit-batch N` | `0` | `0` = commit por subdiretório; `N` = a cada N registros |
 | `--config PATH` | `config.ini` | Caminho para config.ini |
 
-## Configuração
-Scripts esperam `config.ini` na raiz do repositório com credenciais de banco.
+## Transform — ordem de execucao
+
+1. `cleanup.py` — normalizacao textual (fases: text, sentinel, identifiers, title_subtitle, capitalization)
+2. `postprocess.py` — limpeza estrutural (junk, orphans, persons dedup/signatures)
+3. `metrics.py` — metricas + sphinx summaries
+
+Sempre executar `--dry-run` antes de rodar contra o banco de producao.
+
+### Shrink guard (cleanup.py)
+
+`cleanup.py` inclui uma guarda que rejeita updates onde o texto limpo tem menos de 50% do comprimento original (para textos > 20 chars). Se `skip_shrink > 0` aparecer nos logs, investigar antes de prosseguir.
+
+### Regex em SQL (Python raw string → MariaDB → PCRE)
+
+MariaDB consome backslashes de strings SQL antes de passar ao regex engine. Em raw strings Python:
+- `\\s` → MariaDB recebe `\s` → vira `s` (letra, NAO whitespace) — **ERRADO**
+- `\\\\s` → MariaDB recebe `\\s` → vira `\s` (whitespace) — **CORRETO**
+
+Hifens em character classes: SEMPRE no final (`[abc-]`). Um `-` entre caracteres cria range — `[:-–]` inclui todas as letras.
+
+Toda regex em SQL deve ser testada com `SELECT 'texto' REGEXP '...'` direto no MariaDB antes de uso.
+
+## Configuracao
+
+Scripts esperam `config.ini` na raiz do repositorio com credenciais de banco.
+
+## Database
+
+Schema em `database/data.schema.sql`. Acesso local: `mariadb data`.

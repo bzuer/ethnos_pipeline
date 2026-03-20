@@ -90,6 +90,12 @@ _ALLCAPS_THRESHOLD = 0.8  # fraction of alpha chars that must be upper
 #  Dataclasses
 # ---------------------------------------------------------------------------
 
+_SHRINK_RATIO_THRESHOLD = 0.5   # reject if cleaned < 50% of original length
+_SHRINK_MIN_ORIGINAL_LEN = 20   # only check ratio when original is this long
+
+_SKIP = object()  # sentinel: _check_update returns this to mean "do not update"
+
+
 @dataclass
 class ColumnStats:
     scanned: int = 0
@@ -97,12 +103,13 @@ class ColumnStats:
     updated: int = 0
     skipped_integrity: int = 0
     skipped_empty: int = 0
+    skipped_shrink: int = 0
     errors: int = 0
 
     def add(self, other: "ColumnStats") -> None:
         for attr in (
             "scanned", "changed", "updated",
-            "skipped_integrity", "skipped_empty", "errors",
+            "skipped_integrity", "skipped_empty", "skipped_shrink", "errors",
         ):
             setattr(self, attr, getattr(self, attr) + getattr(other, attr))
 
@@ -122,8 +129,10 @@ def clean_text_value(
         return None
     if not isinstance(value, str):
         value = str(value)
-    cleaned = html.unescape(value)
-    cleaned = HTML_TAG_RE.sub(" ", cleaned)
+    # Strip real HTML tags BEFORE unescaping entities — otherwise
+    # "&lt;text&gt;" becomes "<text>" which HTML_TAG_RE destroys.
+    cleaned = HTML_TAG_RE.sub(" ", value)
+    cleaned = html.unescape(cleaned)
     cleaned = unicodedata.normalize("NFKC", cleaned)
     cleaned = INVISIBLE_OR_CONTROL_RE.sub(" ", cleaned)
     cleaned = cleaned.replace("\ufffd", " ")
@@ -273,6 +282,7 @@ def discover_target_columns(
     conn: mariadb.Connection,
     include_tables: Optional[set] = None,
     include_columns: Optional[set] = None,
+    skip_column_exclusions: bool = False,
 ) -> List[Dict]:
     db_name = get_database_name(conn)
     cur = conn.cursor()
@@ -312,7 +322,7 @@ def discover_target_columns(
     for table, column, pk_columns, is_unique, is_pk_col in rows:
         if table in EXCLUDED_TABLES:
             continue
-        if column in EXCLUDED_COLUMNS:
+        if not skip_column_exclusions and column in EXCLUDED_COLUMNS:
             continue
         if include_tables and table not in include_tables:
             continue
@@ -448,10 +458,44 @@ def process_column(
     transform: Callable[[Optional[str]], Optional[str]],
     batch_size: int, flush_size: int,
     limit: int, dry_run: bool, verbose_every: int,
+    shrink_guard: bool = True,
 ) -> ColumnStats:
     stats = ColumnStats()
     updates: List[Tuple] = []
     read_cur = conn.cursor()
+
+    def _check_update(raw: str, cleaned, stats: ColumnStats):
+        """Validate a cleaned value before queuing an update.
+
+        Returns _SKIP to reject, None to set SQL NULL, or a string to write.
+        """
+        # transform returned "no change"
+        if cleaned == raw:
+            return _SKIP
+        # transform signals "set to NULL" (used by sentinel phase)
+        if cleaned is None:
+            stats.changed += 1
+            return None  # will become SQL NULL
+        # cleaned to empty string — reject
+        if cleaned == "":
+            stats.skipped_empty += 1
+            return _SKIP
+        # --- shrink guard: reject drastic truncation ---
+        if shrink_guard:
+            raw_len = len(raw)
+            if (raw_len >= _SHRINK_MIN_ORIGINAL_LEN
+                    and len(cleaned) / raw_len < _SHRINK_RATIO_THRESHOLD):
+                if stats.skipped_shrink == 0:
+                    log.warning(
+                        "  SHRINK GUARD: %s.%s — original (%d chars) → cleaned "
+                        "(%d chars): %r → %r",
+                        table, column, raw_len, len(cleaned),
+                        raw[:80], cleaned[:80],
+                    )
+                stats.skipped_shrink += 1
+                return _SKIP
+        stats.changed += 1
+        return cleaned
 
     if len(pk_cols) == 1:
         last_pk = None
@@ -464,14 +508,10 @@ def process_column(
                 break
             for pk_val, raw in rows:
                 stats.scanned += 1
-                cleaned = transform(raw)
-                if cleaned is None or cleaned == raw:
+                value = _check_update(raw, transform(raw), stats)
+                if value is _SKIP:
                     continue
-                if cleaned == "":
-                    stats.skipped_empty += 1
-                    continue
-                stats.changed += 1
-                updates.append((cleaned, pk_val))
+                updates.append((value, pk_val))
                 if len(updates) >= flush_size:
                     flush_updates(conn, table, column, pk_cols, updates, dry_run, stats)
                     updates.clear()
@@ -480,7 +520,8 @@ def process_column(
                 log.info(
                     f"  {table}.{column}: scanned={stats.scanned} "
                     f"changed={stats.changed} updated={stats.updated} "
-                    f"skip_integrity={stats.skipped_integrity}"
+                    f"skip_integrity={stats.skipped_integrity} "
+                    f"skip_shrink={stats.skipped_shrink}"
                 )
     else:
         offset = 0
@@ -495,14 +536,10 @@ def process_column(
                 raw = row[-1]
                 pk_vals = row[:-1]
                 stats.scanned += 1
-                cleaned = transform(raw)
-                if cleaned is None or cleaned == raw:
+                value = _check_update(raw, transform(raw), stats)
+                if value is _SKIP:
                     continue
-                if cleaned == "":
-                    stats.skipped_empty += 1
-                    continue
-                stats.changed += 1
-                updates.append((cleaned, *pk_vals))
+                updates.append((value, *pk_vals))
                 if len(updates) >= flush_size:
                     flush_updates(conn, table, column, pk_cols, updates, dry_run, stats)
                     updates.clear()
@@ -511,7 +548,8 @@ def process_column(
                 log.info(
                     f"  {table}.{column}: scanned={stats.scanned} "
                     f"changed={stats.changed} updated={stats.updated} "
-                    f"skip_integrity={stats.skipped_integrity}"
+                    f"skip_integrity={stats.skipped_integrity} "
+                    f"skip_shrink={stats.skipped_shrink}"
                 )
 
     read_cur.close()
@@ -551,19 +589,21 @@ def run_text_phase(
                 f"[text] {t['table']}.{t['column']}: scanned={stats.scanned} "
                 f"changed={stats.changed} updated={stats.updated} "
                 f"skip_integrity={stats.skipped_integrity} "
-                f"skip_empty={stats.skipped_empty} errors={stats.errors}"
+                f"skip_empty={stats.skipped_empty} skip_shrink={stats.skipped_shrink} "
+                f"errors={stats.errors}"
             )
     return total
 
 
 def _sentinel_transform(value: Optional[str]) -> Optional[str]:
+    """Return None to signal 'set column to SQL NULL' for sentinel values."""
     if value is None:
-        return None
+        return value  # already NULL, no change (will match raw → skip)
     if not isinstance(value, str):
         value = str(value)
     trimmed = value.strip()
     if not trimmed:
-        return value
+        return value  # empty but not a sentinel
     return None if trimmed.lower() in SENTINEL_TO_NULL else value
 
 
@@ -586,6 +626,7 @@ def run_sentinel_phase(
             conn, t["table"], t["column"], t["pk_cols"], _sentinel_transform,
             args.batch_size, args.flush_size,
             args.limit_per_column, args.dry_run, args.verbose_every,
+            shrink_guard=False,
         )
         total.add(stats)
         if stats.changed:
@@ -689,7 +730,9 @@ def run_identifier_phase(
     for table, column, fn in id_targets:
         if table == "work_references" and column == "cited_doi":
             _dedup_work_references_cited_doi(conn, args.dry_run)
-        cols = discover_target_columns(conn, {table}, {column})
+        cols = discover_target_columns(
+            conn, {table}, {column}, skip_column_exclusions=True,
+        )
         if not cols:
             continue
         t = cols[0]
@@ -697,6 +740,7 @@ def run_identifier_phase(
             conn, t["table"], t["column"], t["pk_cols"], fn,
             args.batch_size, args.flush_size,
             args.limit_per_column, args.dry_run, args.verbose_every,
+            shrink_guard=False,
         )
         total.add(stats)
         if stats.changed or stats.errors:
@@ -844,6 +888,8 @@ def run_title_subtitle_phase(
             if not new_subtitle:
                 stats.skipped_empty += 1
                 continue
+            # Capitalize first letter of subtitle
+            new_subtitle = new_subtitle[0].upper() + new_subtitle[1:]
             stats.changed += 1
             updates.append((new_title, new_subtitle, row_id))
             if len(updates) >= flush_size:
@@ -906,10 +952,19 @@ def _flush_title_subtitle(
 #  Capitalization fix
 # ---------------------------------------------------------------------------
 
+def _capitalize_first(value: Optional[str]) -> Optional[str]:
+    """Capitalize the first letter of a string, leaving the rest unchanged."""
+    if not value or not isinstance(value, str):
+        return value
+    if not value[0].islower():
+        return value
+    return value[0].upper() + value[1:]
+
+
 def run_capitalization_phase(
     conn: mariadb.Connection, args: argparse.Namespace,
 ) -> ColumnStats:
-    """Fix ALL CAPS and all-lowercase titles and subtitles in works."""
+    """Fix ALL CAPS, all-lowercase, and lowercase-initial titles/subtitles."""
     log.info("=== Fase: capitalization ===")
     total = ColumnStats()
 
@@ -918,6 +973,8 @@ def run_capitalization_phase(
         if not cols:
             continue
         t = cols[0]
+
+        # Pass 1: ALL CAPS / all lowercase → titlecase
         stats = process_column(
             conn, t["table"], t["column"], t["pk_cols"], fix_capitalization,
             args.batch_size, args.flush_size,
@@ -929,7 +986,23 @@ def run_capitalization_phase(
                 f"[capitalization] works.{column}: scanned={stats.scanned} "
                 f"changed={stats.changed} updated={stats.updated} "
                 f"skip_integrity={stats.skipped_integrity} "
-                f"skip_empty={stats.skipped_empty} errors={stats.errors}"
+                f"skip_empty={stats.skipped_empty} skip_shrink={stats.skipped_shrink} "
+                f"errors={stats.errors}"
+            )
+
+        # Pass 2: first letter lowercase → capitalize
+        stats2 = process_column(
+            conn, t["table"], t["column"], t["pk_cols"], _capitalize_first,
+            args.batch_size, args.flush_size,
+            args.limit_per_column, args.dry_run, args.verbose_every,
+            shrink_guard=False,
+        )
+        total.add(stats2)
+        if stats2.changed or stats2.errors:
+            log.info(
+                f"[capitalize_first] works.{column}: scanned={stats2.scanned} "
+                f"changed={stats2.changed} updated={stats2.updated} "
+                f"errors={stats2.errors}"
             )
     return total
 
@@ -990,9 +1063,15 @@ def main() -> None:
             log.info(
                 f"=== Resumo: scanned={grand.scanned} changed={grand.changed} "
                 f"updated={grand.updated} skip_integrity={grand.skipped_integrity} "
-                f"skip_empty={grand.skipped_empty} errors={grand.errors} "
-                f"elapsed={time.time() - started:.1f}s ==="
+                f"skip_empty={grand.skipped_empty} skip_shrink={grand.skipped_shrink} "
+                f"errors={grand.errors} elapsed={time.time() - started:.1f}s ==="
             )
+            if grand.skipped_shrink > 0:
+                log.warning(
+                    "ATENÇÃO: %d valores foram rejeitados pelo shrink guard — "
+                    "verifique se alguma transformação está truncando texto "
+                    "indevidamente.", grand.skipped_shrink,
+                )
     finally:
         try:
             conn.close()

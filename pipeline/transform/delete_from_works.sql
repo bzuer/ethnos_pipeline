@@ -1,0 +1,332 @@
+-- ============================================================
+-- DATA CLEANUP SCRIPT — adjusted
+-- Target: MariaDB 11.8+ (collation uca1400_ai_ci)
+-- ============================================================
+
+-- ============================================================
+-- §0  ABSTRACT / TITLE PREFIX CLEANING
+-- ============================================================
+
+-- Strip leading "Abstract:", "Resumen:", "Resumo:" etc. (case-insensitive via collation)
+UPDATE works
+SET abstract = TRIM(REGEXP_REPLACE(
+    abstract,
+    '^(abstract|resumen|resumo|résumé|zusammenfassung|sommario|riassunto)[[:space:]]*:?[[:space:]]*',
+    ''
+))
+WHERE abstract REGEXP '^(abstract|resumen|resumo|résumé|zusammenfassung|sommario|riassunto)[[:space:]]*:?';
+
+-- Strip leading punctuation/whitespace remnants from abstract
+UPDATE works
+SET abstract = TRIM(REGEXP_REPLACE(abstract, '^[[:space:]:\\-–—]+', ''))
+WHERE abstract REGEXP '^[[:space:]:\\-–—]+';
+
+-- Null out abstracts that became empty
+UPDATE works SET abstract = NULL
+WHERE abstract IS NOT NULL AND TRIM(abstract) = '';
+
+-- Strip leading non-alpha junk from titles
+UPDATE works
+SET title = TRIM(REGEXP_REPLACE(title, '^[^[:alpha:]]+', ''))
+WHERE title REGEXP '^[^[:alpha:]]';
+
+
+-- ============================================================
+-- §1  DELETE JUNK / NON-SCHOLARLY WORKS
+--
+--     DESIGN PRINCIPLES:
+--     - Exact match (IN list) for standalone boilerplate titles.
+--     - Anchored prefix (LIKE 'x%') for editorial/admin patterns.
+--     - REGEX only for structural patterns (ed./eds., pagination, ISBN, currency).
+--     - NO unanchored '%keyword%' on ambiguous terms (review, index,
+--       cover, contents, notes, varia, appendix, correspondence, etc.)
+--       to avoid deleting legitimate research works.
+-- ============================================================
+
+DELETE FROM works
+WHERE
+
+    -- --------------------------------------------------------
+    -- 1a. Empty / placeholder / garbage
+    -- --------------------------------------------------------
+    TRIM(COALESCE(title, '')) = ''
+    OR LOWER(TRIM(title)) IN (
+        '-', '--', '---', 'n/a', 'na', 'none', 'unknown', 'untitled',
+        'no title', 'title unavailable', 'título indisponível',
+        'título não disponível', 'sans titre', 'ohne titel', 'senza titolo'
+    )
+    OR title LIKE '%.%.%.%'
+    OR title LIKE '%,%,%.'
+    OR title LIKE '%.%:%'
+    OR title LIKE '%.%,%.%'
+    OR title LIKE '%.%)%.%'
+    OR title LIKE '%.%,%:%'
+
+    -- --------------------------------------------------------
+    -- 1b. Exact standalone boilerplate titles
+    -- --------------------------------------------------------
+    OR LOWER(TRIM(title)) IN (
+        -- English
+        'publications received', 'notes', 'notes and news',
+        'notes of the quarter', 'note of the quarter',
+        'back numbers of the journal', 'rejoinder', 'discussion',
+        'comment', 'comments', 'reply',
+        'international meetings', 'annual meeting',
+        -- Front/back matter
+        'front matter', 'back matter', 'front cover', 'back cover',
+        'cover and front matter', 'cover and back matter',
+        'table of contents', 'masthead', 'impressum', 'colophon',
+        -- Editorial board
+        'editorial board', 'conselho editorial', 'comitê editorial',
+        'equipo editorial', 'comité de rédaction', 'herausgeber',
+        -- Contributors
+        'about the authors', 'notes on contributors', 'notes on contributor',
+        'contributors', 'contributor', 'contribuidores',
+        'colaboradores', 'collaborators',
+        'author biographies', 'author biography',
+        'biographical note', 'biographical notes',
+        'notas sobre os colaboradores', 'notas sobre los colaboradores',
+        -- Misc boilerplate
+        'miscellaneous', 'recent scholarship', 'recently published',
+        'new publications', 'back issues',
+        'books received', 'obras recebidas', 'libros recibidos',
+        'new books', 'publications reçues', 'eingegangene publikationen',
+        -- Events
+        'call for papers', 'call for submissions',
+        'conference announcement', 'conference report', 'conference program',
+        'symposium announcement', 'meeting report', 'minutes of meeting',
+        'agenda',
+        -- Abstracts / summaries as title
+        'abstract', 'abstracts', 'resumo', 'resumos',
+        'resumen', 'resúmenes', 'résumé', 'résumés',
+        'zusammenfassung', 'zusammenfassungen',
+        -- TOC / index
+        'toc', 'subject index', 'author index', 'keyword index',
+        'contents', 'sumário', 'sumario', 'índice', 'indice',
+        'índices', 'indices', 'contents volume', 'annual index',
+        -- Correspondence (standalone)
+        'correspondence',
+        -- Presentation / foreword
+        'preface', 'foreword', 'avant-propos',
+        'apresentação', 'presentación',
+        -- Issue info
+        'issue information',
+        -- Regional
+        'expediente', 'table des illustrations',
+        'the bantu treasury series', 'the vilakazi prize',
+        'witwatersrand university press', 'un publications',
+        -- Matéria capa
+        'matéria de capa', 'matéria final',
+        'materias preliminares', 'materias finales'
+    )
+
+    -- --------------------------------------------------------
+    -- 1c. Anchored prefix patterns (LIKE 'x%')
+    -- --------------------------------------------------------
+
+    -- Administrative / lists
+    OR title LIKE 'list of %'
+    OR title LIKE 'message from %'
+    OR title LIKE 'program for %'
+    OR title LIKE 'surveys by %'
+
+    -- Acknowledgments (all languages)
+    OR title LIKE 'acknowledgment%'
+    OR title LIKE 'acknowledgement%'
+    OR title LIKE 'agradecimiento%'
+    OR title LIKE 'agradecimento%'
+    OR title LIKE 'remerciement%'
+    OR title LIKE 'danksagung%'
+    OR title LIKE 'ringraziament%'
+
+    -- Editorials (anchored start)
+    OR title LIKE 'editorial%'
+    OR title LIKE 'note from the editor%'
+    OR title LIKE 'from the editor%'
+    OR title LIKE 'carta do editor%'
+    OR title LIKE 'letter from the editor%'
+
+    -- Announcements (anchored)
+    OR title LIKE 'announcement%'
+    OR title LIKE 'anúncio%'
+    OR title LIKE 'anuncio%'
+    OR title LIKE 'mitteilung%'
+    OR title LIKE 'avviso%'
+    OR title LIKE 'avvisi %'
+
+    -- Corrections / errata / retractions (anchored with delimiter)
+    OR title LIKE 'correction:%'
+    OR title LIKE 'correction to %'
+    OR title LIKE 'corrections:%'
+    OR title LIKE 'corrections to %'
+    OR title LIKE 'corrigendum%'
+    OR title LIKE 'corregendum%'
+    OR title LIKE 'errata%'
+    OR title LIKE 'erratum%'
+    OR title LIKE 'correção%'
+    OR title LIKE 'correções%'
+    OR title LIKE 'retraction:%'
+    OR title LIKE 'retraction of %'
+    OR title LIKE 'retracted:%'
+    OR title LIKE 'expression of concern%'
+
+    -- TOC / index (anchored)
+    OR title LIKE 'index to volume%'
+    OR title LIKE 'index for volume%'
+    OR title LIKE 'contents of volume%'
+
+    -- Issue info (anchored)
+    OR title LIKE 'issue information%'
+    OR title LIKE 'informações do fascículo%'
+    OR title LIKE 'información del número%'
+    OR title LIKE 'informazioni del fascicolo%'
+
+    -- Call for papers (anchored)
+    OR title LIKE 'call for papers%'
+    OR title LIKE 'call for submissions%'
+
+    -- Letters to editor (anchored)
+    OR title LIKE 'letter to the editor%'
+    OR title LIKE 'letters to the editor%'
+
+    -- Book reviews (anchored with delimiter — "Book Review: ..." is junk;
+    -- "A Review of Particle Physics" is NOT matched)
+    OR title LIKE 'book review:%'
+    OR title LIKE 'book reviews:%'
+    OR title LIKE 'book review -%'
+    OR title LIKE 'resenha:%'
+    OR title LIKE 'reseña:%'
+    OR title LIKE 'comptes rendus%'
+    OR title LIKE 'comptes-rendus%'
+    OR title LIKE 'rezension:%'
+    OR title LIKE 'rezensionen:%'
+    OR title LIKE 'reviewed by %'
+
+    -- Communications (anchored)
+    OR title LIKE 'communications, comments%'
+
+    -- Notices (exact-ish, anchored)
+    OR LOWER(TRIM(title)) IN ('notice', 'notices')
+
+    -- Teses / dissertações (anchored)
+    OR title LIKE 'teses %'
+    OR title LIKE 'dissertações %'
+
+    -- --------------------------------------------------------
+    -- 1d. REGEX patterns — structural debris
+    -- --------------------------------------------------------
+
+    -- Editor attribution at end of title: "..., ed." / "..., eds." / "... (ed.)" / "... (eds.)"
+    OR title REGEXP ',\\s*eds?\\.?\\s*$'
+    OR title REGEXP '\\(eds?\\.?\\)\\s*$'
+
+    -- Pagination at end: "..., 320 pp." / "..., 320 pp"
+    OR title REGEXP ',\\s*[0-9]+\\s*pp\\.?\\s*$'
+    OR title REGEXP ',\\s*[0-9]+\\s*pages?\\s*$'
+
+    -- ISBN embedded in title
+    OR title REGEXP '\\bISBN[\\s:\\-]*[0-9Xx\\-]{10,}'
+
+    -- Price with currency code: "USD 29.95", "EUR 35", "GBP 20"
+    OR title REGEXP '\\b(USD|GBP|EUR|BRL|AUD|CAD|CHF)\\s*[0-9]+'
+
+    -- Price with currency symbol followed by amount (bibliographic debris)
+    -- Anchored: symbol + digits + dot + digits to avoid false positives
+    OR title REGEXP '[\\$£€]\\s*[0-9]+\\.[0-9]{2}'
+;
+
+
+-- ============================================================
+-- §2  NULLIFY PYTHON 'None' STRING LITERALS
+-- ============================================================
+
+UPDATE publications
+SET
+    volume         = NULLIF(volume, 'None'),
+    pmid           = NULLIF(pmid, 'None'),
+    pmcid          = NULLIF(pmcid, 'None'),
+    isbn           = NULLIF(isbn, 'None'),
+    asin           = NULLIF(asin, 'None'),
+    udc            = NULLIF(udc, 'None'),
+    lbc            = NULLIF(lbc, 'None'),
+    ddc            = NULLIF(ddc, 'None'),
+    lcc            = NULLIF(lcc, 'None'),
+    google_book_id = NULLIF(google_book_id, 'None')
+WHERE
+    volume = 'None' OR pmid = 'None' OR pmcid = 'None' OR isbn = 'None'
+    OR asin = 'None' OR udc = 'None' OR lbc = 'None'
+    OR ddc = 'None' OR lcc = 'None' OR google_book_id = 'None';
+
+UPDATE files
+SET
+    language = NULLIF(language, 'None'),
+    sha1     = NULLIF(sha1, 'None'),
+    sha256   = NULLIF(sha256, 'None'),
+    ipfs_cid = NULLIF(ipfs_cid, 'None')
+WHERE
+    language = 'None' OR sha1 = 'None' OR sha256 = 'None' OR ipfs_cid = 'None';
+-- file_format is ENUM — 'None' would fail on INSERT; handle separately if present.
+
+
+-- ============================================================
+-- §3  ORPHAN REMOVAL (LEFT JOIN for performance)
+-- ============================================================
+
+-- 3a. Works without any authorship
+DELETE w FROM works w
+LEFT JOIN authorships a ON a.work_id = w.id
+WHERE a.work_id IS NULL;
+
+-- 3b. Files pointing to nonexistent publications
+DELETE f FROM files f
+LEFT JOIN publications p ON f.publication_id = p.id
+WHERE p.id IS NULL;
+
+-- 3c. Sphinx queue entries for deleted works
+DELETE sq FROM sphinx_queue sq
+LEFT JOIN works w ON sq.work_id = w.id
+WHERE w.id IS NULL;
+
+-- 3d. Venues with zero publications
+DELETE v FROM venues v
+LEFT JOIN publications p ON p.venue_id = v.id
+WHERE p.venue_id IS NULL;
+
+-- 3e. Subjects with zero associations
+DELETE s FROM subjects s
+LEFT JOIN work_subjects  ws ON ws.subject_id = s.id
+LEFT JOIN venue_subjects vs ON vs.subject_id = s.id
+WHERE ws.subject_id IS NULL AND vs.subject_id IS NULL;
+
+-- 3f. Organizations with no references anywhere (single pass)
+DELETE o FROM organizations o
+LEFT JOIN authorships  a   ON o.id = a.affiliation_id
+LEFT JOIN funding      f   ON o.id = f.funder_id
+LEFT JOIN programs     pr  ON o.id = pr.institution_id
+LEFT JOIN publications pub ON o.id = pub.publisher_id
+LEFT JOIN venues       ve  ON o.id = ve.publisher_id
+WHERE a.affiliation_id  IS NULL
+  AND f.funder_id       IS NULL
+  AND pr.institution_id IS NULL
+  AND pub.publisher_id  IS NULL
+  AND ve.publisher_id   IS NULL;
+
+
+-- ============================================================
+-- §4  OPEN ACCESS PROPAGATION
+-- ============================================================
+
+UPDATE publications p
+JOIN venues v ON p.venue_id = v.id
+SET p.open_access = 1
+WHERE p.open_access = 0
+  AND (v.open_access = 1 OR p.license_url IS NOT NULL OR p.scielo_pid IS NOT NULL);
+
+
+-- ============================================================
+-- §5  CONSISTENCY PROCEDURES
+-- ============================================================
+
+CALL sp_clean_inconsistent_data();
+CALL sp_clean_orphaned_data();
+CALL sp_clean_orphaned_persons();
