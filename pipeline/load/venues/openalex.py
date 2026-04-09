@@ -14,7 +14,12 @@ import re
 import csv
 from typing import Dict, Any, Optional, List, Tuple
 
-from pipeline.load.common import get_connection, normalize_issn
+from pipeline.load.common import (
+    get_connection,
+    ensure_connection,
+    safe_rollback,
+    normalize_issn,
+)
 from pipeline.load.venues.shared import (
     VENUE_MERGE_UNIQUE_FIELDS, VENUE_MERGE_FILL_IF_NULL_FIELDS,
     VENUE_MERGE_BOOL_MAX_FIELDS,
@@ -692,10 +697,14 @@ def merge_internal_duplicates(conn: mariadb.Connection):
                     merged_count += 1
                 else:
                     log.warning(f"    -> Secondary venue {sid} not found for removal (already removed?).")
-                    conn.rollback()
-            except mariadb.Error as e: log.error(f"    -> DB error merging {sid} -> {pid}: {e}"); conn.rollback()
+                    safe_rollback(conn, f"merge_internal_duplicates {sid}->{pid}")
+            except mariadb.Error as e:
+                log.error(f"    -> DB error merging {sid} -> {pid}: {e}")
+                safe_rollback(conn, f"merge_internal_duplicates {sid}->{pid}")
         log.info(f"Internal merges completed: {merged_count} de {len(merge_pairs)}.")
-    except mariadb.Error as e: log.error(f"Internal dedup error: {e}"); conn.rollback()
+    except mariadb.Error as e:
+        log.error(f"Internal dedup error: {e}")
+        safe_rollback(conn, "merge_internal_duplicates")
     finally:
         if cursor: cursor.close()
         log.info("--- Internal dedup completed ---")
@@ -772,9 +781,13 @@ def merge_venues_via_map(conn: mariadb.Connection, json_dir: str, map_file="venu
                          conn.commit(); unified += 1
                     else:
                         log.warning(f"  -> Secondary venue {sid} not found for removal.")
-                        conn.rollback()
-                except mariadb.Error as e: log.error(f"DB error (L{row_num}): {e}"); conn.rollback()
-                except Exception as e: log.error(f"Unexpected error (L{row_num}): {e}", exc_info=True); conn.rollback()
+                        safe_rollback(conn, f"merge_venues_via_map row={row_num}")
+                except mariadb.Error as e:
+                    log.error(f"DB error (L{row_num}): {e}")
+                    safe_rollback(conn, f"merge_venues_via_map row={row_num}")
+                except Exception as e:
+                    log.error(f"Unexpected error (L{row_num}): {e}", exc_info=True)
+                    safe_rollback(conn, f"merge_venues_via_map row={row_num}")
     except FileNotFoundError: log.error(f"Mapa '{map_path}' not found.")
     except Exception as e: log.error(f"Error reading map '{map_path}': {e}", exc_info=True)
     finally:
@@ -782,7 +795,11 @@ def merge_venues_via_map(conn: mariadb.Connection, json_dir: str, map_file="venu
     log.info(f"--- Merge via map completed. {processed} lines, {unified} merges. ---")
 
 
-def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argparse.Namespace):
+def enrich_venues(
+    conn: mariadb.Connection,
+    json_files: List[str],
+    args: argparse.Namespace,
+) -> Tuple[mariadb.Connection, Dict[str, int]]:
 
     if args.dry_run: log.warning("DRY-RUN ativado.")
 
@@ -804,6 +821,7 @@ def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argpars
         cursor_update = None
 
         try:
+            conn = ensure_connection(conn, config_path=args.config)
             with open(json_path, 'r', encoding='utf-8') as f: data = json.load(f)
             venue_label = data.get('display_name') or data.get('id', venue_label)
 
@@ -964,7 +982,8 @@ def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argpars
                     detail = f" +{linked}s" if linked else ""
                     outcome = f"Created{detail}" if was_created else f"Updated (recovered){detail}"
                 else:
-                    conn.rollback()
+                    if not safe_rollback(conn, f"{prefix} {venue_label} create-failed"):
+                        conn = ensure_connection(None, config_path=args.config)
                     outcome = "Error (create failed)"
 
         except FileNotFoundError:
@@ -973,11 +992,13 @@ def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argpars
             outcome = "Error: invalid JSON"
         except mariadb.Error as e_db:
             outcome = f"Error: {e_db}"
-            conn.rollback()
+            if not safe_rollback(conn, f"{prefix} {venue_label} mariadb-error"):
+                conn = ensure_connection(None, config_path=args.config)
         except Exception as e_gen:
             outcome = f"Error: {e_gen}"
             log.debug(f"Traceback for {json_path}:", exc_info=True)
-            conn.rollback()
+            if not safe_rollback(conn, f"{prefix} {venue_label} generic-error"):
+                conn = ensure_connection(None, config_path=args.config)
         finally:
             if cursor_update: cursor_update.close()
             if outcome:
@@ -986,6 +1007,7 @@ def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argpars
                 counters['errors'] += 1
 
     log.info(f"=== Finished: {counters} ===")
+    return conn, counters
 
 
 
@@ -994,6 +1016,7 @@ def main():
     parser.add_argument('--json-dir', required=True, help="Directory with OpenAlex JSON files.")
     parser.add_argument('--batch-size', type=int, default=100, help="Venues per batch (kept for compat).")
     parser.add_argument('--limit', type=int, default=None, help="Max JSON files to process.")
+    parser.add_argument('--config', type=str, default=None, help="Path to config.ini.")
     parser.add_argument('--dry-run', action='store_true', help="Simulate without writing to DB.")
     parser.add_argument('--no-merge-duplicates', action='store_true', help="Disable auto-merge on unique constraint conflict.")
     parser.add_argument('--prefer-db-merge-procedure', action='store_true', help="Try sp_merge_single_venue_pair before Python fallback.")
@@ -1001,7 +1024,7 @@ def main():
 
     conn = None
     try:
-        conn = get_connection()
+        conn = get_connection(config_path=args.config)
 
         if not args.dry_run:
             merge_internal_duplicates(conn)
@@ -1013,16 +1036,15 @@ def main():
             log.error("No JSON files mapped. Check directory.")
             return
 
-        enrich_venues(conn, json_files, args)
+        conn, _ = enrich_venues(conn, json_files, args)
 
     except Exception as e:
         log.critical(f"Critical failure in main process: {e}", exc_info=True)
         if conn:
-            try:
-                conn.rollback()
+            if safe_rollback(conn, "openalex-main-failure"):
                 log.info("Rollback final realizado devido a erro.")
-            except mariadb.Error as rb_err:
-                log.error(f"Error in final rollback: {rb_err}")
+            else:
+                log.error("Error in final rollback.")
     finally:
         if conn:
             try:

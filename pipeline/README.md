@@ -60,6 +60,12 @@ venv/bin/python pipeline/load/venues/scimago.py venues/scimago
 ### Transform
 
 ```bash
+# Preferred: single-entry orchestration (official order + preflight checks)
+venv/bin/python pipeline/transform/orchestrate.py --dry-run
+venv/bin/python pipeline/transform/orchestrate.py
+venv/bin/python pipeline/transform/orchestrate.py --from-step pre_dedup_metrics --to-step post_dedup_metrics
+
+# Manual execution (same order used by orchestrate.py)
 # T0. Procedure setup (run once, or when procedures change)
 mariadb data < pipeline/transform/procedures.sql
 
@@ -85,7 +91,9 @@ venv/bin/python pipeline/transform/metrics.py --full
 mariadb data < pipeline/transform/venue_ranking_setup.sql
 ```
 
-**Key dependency**: T3 must run before T4 (dedup needs sphinx summary tables).
+**Key dependencies**:
+- T3 must run before T4 (dedup needs `work_author_summary` and `sphinx_works_summary`).
+- `metrics.py --full` now resets stale counters for unlinked entities and performs deterministic rebuild of `venue_yearly_stats`.
 
 ## Project Structure
 
@@ -127,6 +135,7 @@ pipeline/
 │       └── scimago.py         # Load SCImago CSV venues
 └── transform/                 # Clean/normalize data in DB
     ├── common.py              # Re-export shim
+    ├── orchestrate.py         # Official transform pipeline runner (preflight + ordered steps)
     ├── cleanup.py             # Text cleanup (5 phases) + DB profile
     ├── procedures.sql         # Stored procedures (version-controlled source)
     ├── delete_from_works.sql  # Junk deletion, orphan removal, OA propagation
@@ -180,6 +189,9 @@ venues/scimago/        # SCImago CSV exports
 
 | Flag | Description |
 |------|-------------|
+| `orchestrate.py --dry-run` | Preview full transform command sequence without executing |
+| `orchestrate.py --from-step/--to-step` | Execute a bounded step range in official order |
+| `orchestrate.py --skip-procedures` | Skip `procedures.sql` when procedures are already up to date |
 | `--mode {profile,run,both}` | cleanup.py: profile DB, run cleanup, or both |
 | `--phase PHASE` | cleanup.py: run specific phase only |
 | `--full` / `--partial` | metrics.py: full recalculation vs fill gaps |
@@ -194,11 +206,23 @@ venues/scimago/        # SCImago CSV exports
 - Never commit `config.ini` or secrets.
 - Never embed SQL regex in Python strings (see CLAUDE.md for details).
 
+## Database Connections
+
+- All DB scripts should connect via `pipeline.common.get_connection` (or wrappers in `pipeline.load.db`).
+- Connection open now includes retry/backoff for transient failures (`too many connections`, `server has gone away`, timeout/refused/lost connection).
+- Long-running loaders should call `ensure_connection` before DB work units to recover from stale/disconnected sessions.
+- `pipeline/extract/works/missing_dois.py` no longer treats DB read errors as empty DOI sets; DB failures now fail the ISSN task explicitly.
+- Optional `[database]` config keys:
+  - `connect_timeout`, `read_timeout`, `write_timeout`
+  - `connection_retries`, `connection_retry_base`, `connection_retry_max`
+  - `session_wait_timeout`, `session_net_read_timeout`, `session_net_write_timeout`
+  - `session_innodb_lock_wait_timeout`, `session_tmp_table_size`, `session_max_heap_table_size`
+
 ## Architecture Decisions
 
 - **Single source of truth**: `EXCLUDED_WORK_TYPES` lives in `load/filtering.py`; extract imports it.
 - **HTTP client**: All extract scripts use `httpx` via `extract/http.create_client`.
-- **DB connection**: All scripts use `pipeline.common.get_connection` (socket discovery + TCP fallback).
+- **DB connection**: All scripts use `pipeline.common.get_connection` (socket discovery + TCP fallback + transient retry/backoff); long loops use `ensure_connection`.
 - **Retry**: Unified `retry_request` with capped 429 backoff: `min(11 * 2^attempt, 120)` seconds.
 - **Stored procedures**: Source-controlled in `transform/procedures.sql` + inline in dedup/ranking SQL files.
 - **Python vs SQL**: Python for text processing, batch orchestration, API calls. SQL for bulk data operations, dedup, ranking.

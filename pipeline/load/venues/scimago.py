@@ -21,6 +21,8 @@ import pycountry
 from pipeline.load.common import (
     build_cache,
     get_connection,
+    ensure_connection,
+    safe_rollback,
     get_or_create_organization,
     normalize_issn,
     normalize_term_key,
@@ -571,7 +573,7 @@ def process_scimago_csv(
         except Exception as e:
             counters["errors"] += 1
             if not dry_run:
-                conn.rollback()
+                safe_rollback(conn, f"scimago {os.path.basename(csv_path)} row={idx}")
                 pending_commits = 0
             log.error("%s %s → Error: %s", prefix, row.get("Title", ""), e)
             log.debug("Traceback:", exc_info=True)
@@ -615,6 +617,7 @@ def main() -> None:
 
         grand_totals: Dict[str, int] = {}
         for csv_path in csv_files:
+            conn = ensure_connection(conn, config_path=args.config)
             counters = process_scimago_csv(
                 conn, csv_path, args.dry_run, args.commit_batch,
                 common_cache, subject_cache,

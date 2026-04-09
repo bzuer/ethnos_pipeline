@@ -46,35 +46,24 @@ log = logging.getLogger(__name__)
 
 
 def _get_connection(config_path=None):
-    """get_connection with extended timeouts for bulk metric operations.
-
-    Overrides both client-side socket timeouts (read_timeout, write_timeout on
-    the connector) and server-side session variables so that heavy aggregation
-    queries like citation-count sync don't get killed mid-flight.
-    """
-    from pipeline.common import read_db_config, _prepare_connection_params
-
-    db_config = read_db_config(config_path=config_path)
-    params = _prepare_connection_params(db_config)
-
-    conn = mariadb.connect(
-        **params,
+    """Connection profile for long-running metrics steps."""
+    return get_connection(
+        config_path=config_path,
         connect_timeout=30,
         read_timeout=3600,
         write_timeout=3600,
+        retries=5,
+        retry_base=1.0,
+        retry_max=12.0,
+        session_options={
+            "wait_timeout": 28800,
+            "net_read_timeout": 3600,
+            "net_write_timeout": 3600,
+            "innodb_lock_wait_timeout": 300,
+            "tmp_table_size": 536870912,
+            "max_heap_table_size": 536870912,
+        },
     )
-    conn.autocommit = False
-
-    cur = conn.cursor()
-    cur.execute("SET NAMES 'utf8mb4' COLLATE 'utf8mb4_uca1400_ai_ci'")
-    cur.execute(
-        "SET SESSION wait_timeout=28800, "
-        "net_read_timeout=3600, net_write_timeout=3600, "
-        "innodb_lock_wait_timeout=300, "
-        "tmp_table_size=536870912, max_heap_table_size=536870912"
-    )
-    cur.close()
-    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +140,28 @@ WORKS_PARTIAL = WORKS_FULL
 PERSONS_FULL: List[Step] = [
 
     Step(
+        "p0_person_zero_unlinked",
+        "Zero person metrics for records with no authorships",
+        """UPDATE persons p
+LEFT JOIN authorships a ON a.person_id = p.id
+SET p.total_works = 0,
+    p.total_citations = 0,
+    p.corresponding_author_count = 0,
+    p.first_publication_year = NULL,
+    p.latest_publication_year = NULL,
+    p.h_index = 0
+WHERE a.person_id IS NULL
+  AND (
+      COALESCE(p.total_works, 0) != 0
+      OR COALESCE(p.total_citations, 0) != 0
+      OR COALESCE(p.corresponding_author_count, 0) != 0
+      OR p.first_publication_year IS NOT NULL
+      OR p.latest_publication_year IS NOT NULL
+      OR COALESCE(p.h_index, 0) != 0
+  )""",
+    ),
+
+    Step(
         "p1_person_stats",
         "Recalculate total_works, total_citations, corresponding_author_count, years",
         """UPDATE persons p
@@ -201,6 +212,15 @@ WHERE p.h_index IS NULL OR p.h_index != calc.h_index""",
         "Rebuild sphinx_persons_summary",
         "CALL sp_update_persons_summary()",
     ),
+
+    Step(
+        "p4_prune_persons_summary_orphans",
+        "Delete sphinx_persons_summary rows for deleted persons",
+        """DELETE s
+FROM sphinx_persons_summary s
+LEFT JOIN persons p ON p.id = s.id
+WHERE p.id IS NULL""",
+    ),
 ]
 
 PERSONS_PARTIAL: List[Step] = [
@@ -235,6 +255,24 @@ WHERE p.h_index IS NULL""",
 # ===================================================================
 
 ORGANIZATIONS_FULL: List[Step] = [
+
+    Step(
+        "o0_org_zero_unlinked",
+        "Zero organization metrics for records with no authorships",
+        """UPDATE organizations o
+LEFT JOIN authorships a ON a.affiliation_id = o.id
+SET o.publication_count = 0,
+    o.researcher_count = 0,
+    o.total_citations = 0,
+    o.open_access_works_count = 0
+WHERE a.affiliation_id IS NULL
+  AND (
+      COALESCE(o.publication_count, 0) != 0
+      OR COALESCE(o.researcher_count, 0) != 0
+      OR COALESCE(o.total_citations, 0) != 0
+      OR COALESCE(o.open_access_works_count, 0) != 0
+  )""",
+    ),
 
     Step(
         "o1_org_stats",
@@ -297,6 +335,26 @@ SET o.publication_count = calc.publication_count,
 VENUES_FULL: List[Step] = [
 
     Step(
+        "v0_venue_zero_unlinked",
+        "Zero venue metrics for records with no publications",
+        """UPDATE venues v
+LEFT JOIN publications p ON p.venue_id = v.id
+SET v.works_count = 0,
+    v.cited_by_count = 0,
+    v.h_index = 0,
+    v.coverage_start_year = NULL,
+    v.coverage_end_year = NULL
+WHERE p.venue_id IS NULL
+  AND (
+      COALESCE(v.works_count, 0) != 0
+      OR COALESCE(v.cited_by_count, 0) != 0
+      OR COALESCE(v.h_index, 0) != 0
+      OR v.coverage_start_year IS NOT NULL
+      OR v.coverage_end_year IS NOT NULL
+  )""",
+    ),
+
+    Step(
         "v1_venue_stats",
         "Recalculate works_count, cited_by_count, coverage_start/end_year",
         """UPDATE venues v
@@ -339,6 +397,12 @@ JOIN (
 ) calc ON v.id = calc.venue_id
 SET v.h_index = calc.h_index
 WHERE v.h_index IS NULL OR v.h_index != calc.h_index""",
+    ),
+
+    Step(
+        "v3a_reset_venue_yearly_stats",
+        "Reset venue_yearly_stats for deterministic full rebuild",
+        "TRUNCATE TABLE venue_yearly_stats",
     ),
 
     Step(
@@ -454,6 +518,15 @@ SPHINX_FULL: List[Step] = [
     ),
 
     Step(
+        "x3b_prune_works_summary_orphans",
+        "Delete sphinx_works_summary rows for deleted works",
+        """DELETE s
+FROM sphinx_works_summary s
+LEFT JOIN works w ON w.id = s.id
+WHERE w.id IS NULL""",
+    ),
+
+    Step(
         "x4_venues_summary",
         "Rebuild sphinx_venues_summary",
         "CALL sp_populate_sphinx_venues_summary()",
@@ -463,6 +536,15 @@ SPHINX_FULL: List[Step] = [
         "x5_persons_summary",
         "Rebuild sphinx_persons_summary",
         "CALL sp_update_persons_summary()",
+    ),
+
+    Step(
+        "x5b_prune_persons_summary_orphans",
+        "Delete sphinx_persons_summary rows for deleted persons",
+        """DELETE s
+FROM sphinx_persons_summary s
+LEFT JOIN persons p ON p.id = s.id
+WHERE p.id IS NULL""",
     ),
 ]
 
@@ -510,7 +592,7 @@ def execute_steps(conn: mariadb.Connection, steps: List[Step],
             elapsed = time.time() - t0
             log.info("  affected=%d elapsed=%.1fs", affected, elapsed)
             cur.close()
-        except mariadb.InterfaceError as e:
+        except (mariadb.InterfaceError, mariadb.OperationalError) as e:
             log.warning("  Connection lost at step %s: %s — reconnecting", step.name, e)
             try:
                 conn.close()

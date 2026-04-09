@@ -23,6 +23,8 @@ import mariadb
 from pipeline.load.common import (
     build_cache,
     get_connection,
+    ensure_connection,
+    safe_rollback,
     get_or_create_organization,
     normalize_issn,
     normalize_term_key,
@@ -714,7 +716,8 @@ def process_scopus_venues(
     commit_batch: int,
     merge_duplicates: bool,
     prefer_db_merge_procedure: bool,
-) -> Dict[str, int]:
+    config_path: Optional[str] = None,
+) -> Tuple[mariadb.Connection, Dict[str, int]]:
     counters = {
         "processed": 0,
         "updated": 0,
@@ -740,6 +743,7 @@ def process_scopus_venues(
         venue_label = os.path.basename(json_path)
         outcome = None
 
+        conn = ensure_connection(conn, config_path=config_path)
         cursor = conn.cursor()
         try:
             with open(json_path, "r", encoding="utf-8") as f:
@@ -884,7 +888,8 @@ def process_scopus_venues(
         except Exception as e:
             counters["errors"] += 1
             if not dry_run:
-                conn.rollback()
+                if not safe_rollback(conn, f"{prefix} {venue_label}"):
+                    conn = ensure_connection(None, config_path=config_path)
                 pending_commits = 0
             outcome = f"Error: {e}"
             log.debug("Traceback for %s:", json_path, exc_info=True)
@@ -896,7 +901,7 @@ def process_scopus_venues(
     if not dry_run and pending_commits > 0:
         conn.commit()
 
-    return counters
+    return conn, counters
 
 
 def main() -> None:
@@ -904,6 +909,7 @@ def main() -> None:
     parser.add_argument("--json-dir", required=True, help="Directory with Scopus JSON files.")
     parser.add_argument("--limit", type=int, default=None, help="Max JSON files to process.")
     parser.add_argument("--commit-batch", type=int, default=200, help="Commit every N changes (0 = per change).")
+    parser.add_argument("--config", type=str, default=None, help="Path to config.ini.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate without writing to DB.")
     parser.add_argument("--no-merge-duplicates", action="store_true", help="Disable auto-merge on unique constraint conflict.")
     parser.add_argument("--prefer-db-merge-procedure", action="store_true", help="Try sp_merge_single_venue_pair before Python fallback.")
@@ -920,14 +926,15 @@ def main() -> None:
 
     conn = None
     try:
-        conn = get_connection()
-        counters = process_scopus_venues(
+        conn = get_connection(config_path=args.config)
+        conn, counters = process_scopus_venues(
             conn=conn,
             json_files=json_files,
             dry_run=args.dry_run,
             commit_batch=args.commit_batch,
             merge_duplicates=not args.no_merge_duplicates,
             prefer_db_merge_procedure=args.prefer_db_merge_procedure,
+            config_path=args.config,
         )
         log.info("=== Finished: %s ===", counters)
     finally:

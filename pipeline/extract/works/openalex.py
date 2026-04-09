@@ -180,7 +180,7 @@ def main():
     db_conn = None
     try:
         from pipeline.common import get_connection
-        db_conn = get_connection()
+        db_conn = get_connection(args.config)
     except Exception as e:
         logging.warning(f"Could not open DB connection for source ID resolution: {e}")
 
@@ -190,7 +190,24 @@ def main():
                 source_id_holder = [None]
 
                 def _pre_bulk():
-                    sid = resolve_openalex_source_id(issn, http_client=client, conn=db_conn)
+                    nonlocal db_conn
+                    if db_conn is not None:
+                        from pipeline.common import ensure_connection
+                        db_conn = ensure_connection(
+                            db_conn,
+                            config_path=args.config,
+                            read_timeout=300,
+                            write_timeout=300,
+                            retries=5,
+                            retry_base=1.0,
+                            retry_max=12.0,
+                        )
+                    sid = resolve_openalex_source_id(
+                        issn,
+                        http_client=client,
+                        conn=db_conn,
+                        config_path=args.config,
+                    )
                     source_id_holder[0] = sid
                     if not sid:
                         logging.warning(f"[{issn}] no OpenAlex source ID — all DOIs go to individual fallback")

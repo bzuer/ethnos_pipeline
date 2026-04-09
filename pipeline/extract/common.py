@@ -34,7 +34,8 @@ logger = logging.getLogger(__name__)
 
 
 def resolve_openalex_source_id(issn: str, eissn: Optional[str] = None,
-                               http_client=None, conn=None) -> Optional[str]:
+                               http_client=None, conn=None,
+                               config_path: Optional[str] = None) -> Optional[str]:
     """Resolve an ISSN to an OpenAlex source ID.
 
     Tries the local database first (91% coverage), then the OpenAlex API as fallback.
@@ -47,7 +48,7 @@ def resolve_openalex_source_id(issn: str, eissn: Optional[str] = None,
     try:
         if own_conn:
             from pipeline.common import get_connection
-            conn = get_connection()
+            conn = get_connection(config_path=config_path)
         cursor = conn.cursor()
         params = [issn]
         clauses = ['issn = ?']

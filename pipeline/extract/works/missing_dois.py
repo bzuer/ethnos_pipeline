@@ -21,12 +21,13 @@ import sys
 import csv
 import os
 import logging
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Set, List, Dict
 
 from habanero import Crossref
 
-from pipeline.common import get_connection
+from pipeline.common import get_connection, ensure_connection
 from pipeline.extract.config import read_config, set_config
 from pipeline.extract.retry import retry_request
 from pipeline.extract.works_common import get_missing_dois_by_year, EXCLUDED_WORK_TYPES
@@ -39,14 +40,16 @@ OUTPUT_DIR = "works/doi/missing"
 
 
 class DoiChecker:
-    def __init__(self, config, from_year: int = None, until_year: int = None):
+    def __init__(self, config, from_year: int = None, until_year: int = None, config_path: str = None):
         self.config = config
+        self.config_path = config_path
         self.api_email = config.get('api', 'email', fallback='anonymous@example.com')
         from pipeline.extract.http import build_user_agent
         user_agent = build_user_agent(config)
         self.crossref_client = Crossref(mailto=self.api_email, ua_string=user_agent, timeout=30)
         self.from_year = from_year
         self.until_year = until_year
+        self._db_local = threading.local()
 
         os.makedirs(DOI_CACHE_DIR, exist_ok=True)
         logging.info(f"Crossref client initialized. DOI cache at '{DOI_CACHE_DIR}'.")
@@ -176,10 +179,24 @@ class DoiChecker:
     # DB comparison
     # ------------------------------------------------------------------
 
+    def _get_thread_connection(self):
+        conn = getattr(self._db_local, "conn", None)
+        conn = ensure_connection(
+            conn,
+            config_path=self.config_path,
+            read_timeout=300,
+            write_timeout=300,
+            retries=5,
+            retry_base=1.0,
+            retry_max=12.0,
+        )
+        self._db_local.conn = conn
+        return conn
+
     def _get_database_dois(self, issn: str) -> Set[str]:
-        conn = None
+        cursor = None
         try:
-            conn = get_connection()
+            conn = self._get_thread_connection()
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT p.doi "
@@ -193,10 +210,20 @@ class DoiChecker:
             return results
         except Exception as e:
             logging.error(f"[{issn}] DB query error: {e}")
-            return set()
+            stale = getattr(self._db_local, "conn", None)
+            if stale is not None:
+                try:
+                    stale.close()
+                except Exception:
+                    pass
+                self._db_local.conn = None
+            raise
         finally:
-            if conn:
-                conn.close()
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
 
     # ------------------------------------------------------------------
     # Main per-ISSN logic
@@ -283,8 +310,10 @@ def main():
     args = parser.parse_args()
 
     if args.relevance is not None:
+        conn = None
+        cursor = None
         try:
-            conn = get_connection()
+            conn = get_connection(args.config)
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT issn, eissn FROM venues "
@@ -297,11 +326,21 @@ def main():
                     issns.append(issn.strip())
                 if eissn:
                     issns.append(eissn.strip())
-            conn.close()
             logging.info(f"Found {len(issns)} ISSNs from venues with llm_relevance >= {args.relevance}.")
         except Exception as e:
             logging.critical(f"DB query for --relevance failed: {e}")
             sys.exit(1)
+        finally:
+            if cursor is not None:
+                try:
+                    cursor.close()
+                except Exception:
+                    pass
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
     else:
         try:
             issns: List[str] = []
@@ -330,7 +369,12 @@ def main():
 
     workers = args.workers if args.workers is not None else config.getint('crossref', 'workers', fallback=2)
 
-    checker = DoiChecker(config, from_year=args.from_year, until_year=args.until_year)
+    checker = DoiChecker(
+        config,
+        from_year=args.from_year,
+        until_year=args.until_year,
+        config_path=args.config,
+    )
 
     if args.force:
         import shutil
