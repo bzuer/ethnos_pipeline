@@ -2,7 +2,8 @@
 -- Stored procedures called by transform scripts.
 --
 -- Callers:
---   delete_from_works.sql  : sp_clean_inconsistent_data, sp_clean_orphaned_data, sp_clean_orphaned_persons
+--   delete_from_works.sql  : sp_clean_inconsistent_data, sp_clean_orphaned_data, sp_clean_orphaned_persons,
+--                            sp_review_reference_consistency
 --   persons_full_process.sql: sp_merge_persons_in_batches, sp_generate_person_signatures, sp_fix_person_name_parts
 --   metrics.py             : sp_update_persons_summary, sp_update_10yr_impact_factors,
 --                            sp_populate_sphinx_venues_summary, sp_update_work_author_summary_all,
@@ -56,6 +57,51 @@ BEGIN
     DELETE p FROM persons p
     LEFT JOIN authorships a ON p.id = a.person_id
     WHERE a.work_id IS NULL;
+END ;;$$
+
+DROP PROCEDURE IF EXISTS `sp_review_reference_consistency`$$
+CREATE PROCEDURE `sp_review_reference_consistency`(IN p_batch_size INT)
+BEGIN
+    DECLARE v_rows_affected INT DEFAULT 1;
+
+    -- Pass 1: unresolved references (doi no longer exists) -> PENDING
+    WHILE v_rows_affected > 0 DO
+        UPDATE work_references wr
+        LEFT JOIN publications p ON wr.cited_doi = p.doi
+        SET
+            wr.status = 'PENDING',
+            wr.cited_work_id = NULL,
+            wr.resolved_at = NULL
+        WHERE
+            p.doi IS NULL
+            AND (wr.status != 'PENDING' OR wr.cited_work_id IS NOT NULL)
+        LIMIT p_batch_size;
+
+        SET v_rows_affected = ROW_COUNT();
+        DO SLEEP(0.1);
+    END WHILE;
+
+    SET v_rows_affected = 1;
+
+    -- Pass 2: resolvable references -> RESOLVED
+    WHILE v_rows_affected > 0 DO
+        UPDATE work_references wr
+        INNER JOIN publications p ON wr.cited_doi = p.doi
+        SET
+            wr.status = 'RESOLVED',
+            wr.cited_work_id = p.work_id,
+            wr.resolved_at = CURRENT_TIMESTAMP
+        WHERE
+            wr.status = 'PENDING'
+            OR wr.cited_work_id IS NULL
+            OR wr.cited_work_id != p.work_id
+        LIMIT p_batch_size;
+
+        SET v_rows_affected = ROW_COUNT();
+        DO SLEEP(0.1);
+    END WHILE;
+
+    SELECT 'Reference consistency review completed.' AS execution_status;
 END ;;$$
 
 
@@ -717,7 +763,9 @@ END ;;$$
 DROP PROCEDURE IF EXISTS `sp_update_work_subjects_summary_all`$$
 CREATE PROCEDURE `sp_update_work_subjects_summary_all`()
 BEGIN
-    REPLACE INTO work_subjects_summary (work_id, subjects_string)
+    TRUNCATE TABLE work_subjects_summary;
+
+    INSERT INTO work_subjects_summary (work_id, subjects_string)
     SELECT
         ws.work_id,
         GROUP_CONCAT(s.term ORDER BY s.term SEPARATOR '; ')
