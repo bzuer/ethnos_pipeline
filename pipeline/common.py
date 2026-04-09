@@ -1,8 +1,19 @@
 import configparser
 import os
+import re
 from typing import Any, Dict, Optional
 
 import mariadb
+
+
+def normalize_issn(raw) -> Optional[str]:
+    """Validate and normalize an ISSN to XXXX-XXXX format. Returns None if invalid."""
+    if not raw:
+        return None
+    compact = re.sub(r'[\s\-]', '', str(raw).strip().upper())
+    if not re.fullmatch(r'[0-9X]{8}', compact):
+        return None
+    return f"{compact[:4]}-{compact[4:]}"
 
 
 DEFAULT_SOCKET_CANDIDATES = (
@@ -32,9 +43,9 @@ def read_db_config(config_path: Optional[str] = None, section: str = "database")
             found = True
             break
     if not found:
-        raise FileNotFoundError("Arquivo de configuração não encontrado.")
+        raise FileNotFoundError("Config file not found.")
     if not parser.has_section(section):
-        raise KeyError(f"Seção [{section}] não encontrada no config.")
+        raise KeyError(f"Section [{section}] not found in config.")
 
     config = dict(parser.items(section))
     if "port" in config:

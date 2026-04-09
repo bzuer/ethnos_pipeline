@@ -20,16 +20,19 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mariadb
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-INGEST_DIR = os.path.dirname(SCRIPT_DIR)
-if INGEST_DIR not in sys.path:
-    sys.path.insert(0, INGEST_DIR)
-
-from common import (  # noqa: E402
+from pipeline.load.common import (
     build_cache,
     get_connection,
     get_or_create_organization,
+    normalize_issn,
     normalize_term_key,
+)
+from pipeline.load.venues.shared import (
+    VENUE_MERGE_UNIQUE_FIELDS, VENUE_MERGE_FILL_IF_NULL_FIELDS,
+    VENUE_MERGE_BOOL_MAX_FIELDS,
+    row_to_dict, as_clean_string, parse_int,
+    find_conflict_id_by_unique_field, _get_venue_for_merge,
+    merge_venues_python_fallback,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -49,49 +52,7 @@ SCOPUS_SUBJECT_VOCAB = "Scopus"
 SCOPUS_SUBJECT_TYPE = "SubjectArea"
 SCOPUS_SUBJECT_SOURCE = "scopus"
 
-VENUE_MERGE_UNIQUE_FIELDS = ("issn", "eissn", "scopus_id", "wikidata_id", "openalex_id", "mag_id")
-VENUE_MERGE_FILL_IF_NULL_FIELDS = (
-    "abbreviated_name",
-    "publisher_id",
-    "country_code",
-    "issn",
-    "eissn",
-    "homepage_url",
-    "aggregation_type",
-    "scopus_id",
-    "wikidata_id",
-    "openalex_id",
-    "scielo_id",
-    "mag_id",
-)
-VENUE_MERGE_BOOL_MAX_FIELDS = ("open_access", "is_in_doaj", "is_in_scielo", "is_indexed_in_scopus")
-
-
-def row_to_dict(cursor: mariadb.Cursor, row: Optional[tuple]) -> Optional[Dict[str, Any]]:
-    if not row:
-        return None
-    columns = [d[0] for d in cursor.description]
-    return dict(zip(columns, row))
-
-
-def as_clean_string(value: Any, max_len: Optional[int] = None) -> Optional[str]:
-    if value is None:
-        return None
-    clean = str(value).strip()
-    if not clean:
-        return None
-    if max_len is not None:
-        clean = clean[:max_len]
-    return clean
-
-
-def parse_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
+# VENUE_MERGE_*, row_to_dict, as_clean_string, parse_int imported from venues.shared
 
 
 def parse_decimal(value: Any) -> Optional[float]:
@@ -118,15 +79,6 @@ def parse_bool_to_int(value: Any) -> Optional[int]:
         return 0
     return None
 
-
-def normalize_issn(raw: Any) -> Optional[str]:
-    value = as_clean_string(raw, 32)
-    if not value:
-        return None
-    compact = value.replace("-", "").upper()
-    if not re.fullmatch(r"[0-9X]{8}", compact):
-        return None
-    return f"{compact[:4]}-{compact[4:]}"
 
 
 def normalize_venue_type(aggregation_type: Optional[str]) -> str:
@@ -299,21 +251,6 @@ def find_existing_venue(
     return None, None
 
 
-def find_conflict_id_by_unique_field(
-    cursor: mariadb.Cursor,
-    field: str,
-    value: Optional[str],
-    current_id: int,
-) -> Optional[int]:
-    if value is None:
-        return None
-    cursor.execute(f"SELECT id FROM venues WHERE {field} = ? LIMIT 1", (value,))
-    row = cursor.fetchone()
-    if row and row[0] != current_id:
-        return row[0]
-    return None
-
-
 def find_conflict_id_by_issn_or_eissn(
     cursor: mariadb.Cursor,
     value: Optional[str],
@@ -353,136 +290,6 @@ def _consume_cursor_result_sets(cursor: mariadb.Cursor) -> None:
             pass
 
 
-def _get_venue_for_merge(cursor: mariadb.Cursor, venue_id: int) -> Optional[Dict[str, Any]]:
-    merge_cols = (
-        "id, name, type, abbreviated_name, publisher_id, country_code, "
-        "issn, eissn, homepage_url, aggregation_type, scopus_id, "
-        "wikidata_id, openalex_id, scielo_id, mag_id, "
-        "open_access, is_in_doaj, is_in_scielo, is_indexed_in_scopus"
-    )
-    cursor.execute(f"SELECT {merge_cols} FROM venues WHERE id = ? FOR UPDATE", (venue_id,))
-    return row_to_dict(cursor, cursor.fetchone())
-
-
-def merge_venues_python_fallback(
-    cursor: mariadb.Cursor,
-    primary_venue_id: int,
-    secondary_venue_id: int,
-    conflict_field: str,
-) -> bool:
-    if primary_venue_id == secondary_venue_id:
-        return False
-
-    primary = _get_venue_for_merge(cursor, primary_venue_id)
-    if not primary:
-        raise mariadb.OperationalError(f"Venue primário {primary_venue_id} não encontrado para merge.")
-
-    secondary = _get_venue_for_merge(cursor, secondary_venue_id)
-    if not secondary:
-        log.info(
-            "  -> Merge fallback (field=%s): venue secundário %s já não existe; tratando como unificado.",
-            conflict_field,
-            secondary_venue_id,
-        )
-        return True
-
-    cursor.execute(
-        "UPDATE publications SET venue_id = ? WHERE venue_id = ?",
-        (primary_venue_id, secondary_venue_id),
-    )
-    moved_pubs = cursor.rowcount
-
-    cursor.execute(
-        """
-        INSERT IGNORE INTO venue_subjects (venue_id, subject_id, score, source)
-        SELECT ?, subject_id, score, source
-        FROM venue_subjects
-        WHERE venue_id = ?
-        """,
-        (primary_venue_id, secondary_venue_id),
-    )
-    merged_subjects = cursor.rowcount
-
-    cursor.execute(
-        """
-        UPDATE venue_yearly_stats p
-        JOIN venue_yearly_stats s
-          ON s.year = p.year
-         AND s.venue_id = ?
-        SET
-            p.works_count = COALESCE(p.works_count, 0) + COALESCE(s.works_count, 0),
-            p.oa_works_count = COALESCE(p.oa_works_count, 0) + COALESCE(s.oa_works_count, 0),
-            p.cited_by_count = COALESCE(p.cited_by_count, 0) + COALESCE(s.cited_by_count, 0)
-        WHERE p.venue_id = ?
-        """,
-        (secondary_venue_id, primary_venue_id),
-    )
-
-    cursor.execute(
-        """
-        INSERT INTO venue_yearly_stats (venue_id, year, works_count, oa_works_count, cited_by_count)
-        SELECT ?, s.year, s.works_count, s.oa_works_count, s.cited_by_count
-        FROM venue_yearly_stats s
-        LEFT JOIN venue_yearly_stats p
-               ON p.venue_id = ?
-              AND p.year = s.year
-        WHERE s.venue_id = ?
-          AND p.venue_id IS NULL
-        """,
-        (primary_venue_id, primary_venue_id, secondary_venue_id),
-    )
-
-    cursor.execute("DELETE FROM venues WHERE id = ?", (secondary_venue_id,))
-
-    update_fields: Dict[str, Any] = {}
-    for field in VENUE_MERGE_FILL_IF_NULL_FIELDS:
-        primary_val = primary.get(field)
-        secondary_val = secondary.get(field)
-        if primary_val is not None or secondary_val is None:
-            continue
-
-        if field in VENUE_MERGE_UNIQUE_FIELDS:
-            cursor.execute(f"SELECT id FROM venues WHERE {field} = ? AND id <> ? LIMIT 1", (secondary_val, primary_venue_id))
-            conflict = cursor.fetchone()
-            if conflict:
-                log.warning(
-                    "  -> Merge fallback (field=%s): valor '%s' de %s não transferido para venue %s (já usado por venue %s).",
-                    conflict_field,
-                    secondary_val,
-                    field,
-                    primary_venue_id,
-                    conflict[0],
-                )
-                continue
-
-        update_fields[field] = secondary_val
-
-    for field in VENUE_MERGE_BOOL_MAX_FIELDS:
-        primary_v = int(bool(primary.get(field)))
-        secondary_v = int(bool(secondary.get(field)))
-        merged_v = max(primary_v, secondary_v)
-        if primary.get(field) is None or merged_v != primary_v:
-            update_fields[field] = merged_v
-
-    if update_fields:
-        clauses = ", ".join([f"`{k}` = ?" for k in update_fields])
-        params = list(update_fields.values()) + [primary_venue_id]
-        cursor.execute(
-            f"UPDATE venues SET {clauses}, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-            tuple(params),
-        )
-
-    log.warning(
-        "  -> Duplicata unificada via fallback Python por %s: primary=%s <- secondary=%s (pubs:%s, subjects:%s).",
-        conflict_field,
-        primary_venue_id,
-        secondary_venue_id,
-        moved_pubs,
-        merged_subjects,
-    )
-    return True
-
-
 def attempt_merge_duplicate(
     cursor: mariadb.Cursor,
     primary_venue_id: int,
@@ -519,7 +326,7 @@ def attempt_merge_duplicate(
             return True
         except mariadb.Error as e_proc:
             log.error(
-                "  -> Falha ao unificar via procedure (primary=%s, secondary=%s, field=%s): %s",
+                "  -> Failed to merge via procedure (primary=%s, secondary=%s, field=%s): %s",
                 primary_venue_id,
                 secondary_venue_id,
                 conflict_field,
@@ -530,7 +337,7 @@ def attempt_merge_duplicate(
         return merge_venues_python_fallback(cursor, primary_venue_id, secondary_venue_id, conflict_field)
     except mariadb.Error as e_fallback:
         log.error(
-            "  -> Falha ao unificar via fallback Python (primary=%s, secondary=%s, field=%s): %s",
+            "  -> Failed to merge via Python fallback (primary=%s, secondary=%s, field=%s): %s",
             primary_venue_id,
             secondary_venue_id,
             conflict_field,
@@ -736,7 +543,7 @@ def build_updates_for_existing(
         elif merge_if_conflict(conflict_id, "name+type"):
             pass
         else:
-            log.warning("Conflito de name+type ao atualizar venue ID %s. Mantendo nome atual.", venue_id)
+            log.warning("name+type conflict updating venue ID %s. Keeping current name.", venue_id)
 
     type_source_aggregation = parsed.get("aggregation_type") or as_clean_string(existing.get("aggregation_type"), 50)
     target_type = normalize_venue_type(type_source_aggregation) if type_source_aggregation else None
@@ -751,7 +558,7 @@ def build_updates_for_existing(
             pass
         else:
             log.warning(
-                "Conflito ao atualizar type para venue ID %s (target_type=%s). Mantendo type atual.",
+                "Type conflict updating venue ID %s (target_type=%s). Keeping current type.",
                 venue_id,
                 target_type,
             )
@@ -763,7 +570,7 @@ def build_updates_for_existing(
         elif merge_if_conflict(conflict_id, "issn"):
             pass
         else:
-            log.warning("Conflito de ISSN '%s' ao atualizar venue ID %s. Ignorando.", parsed["issn"], venue_id)
+            log.warning("ISSN conflict '%s' updating venue ID %s. Ignoring.", parsed["issn"], venue_id)
 
     if parsed.get("eissn") and not as_clean_string(existing.get("eissn")):
         conflict_id = find_conflict_id_by_issn_or_eissn(cursor, parsed["eissn"], venue_id)
@@ -772,7 +579,7 @@ def build_updates_for_existing(
         elif merge_if_conflict(conflict_id, "eissn"):
             pass
         else:
-            log.warning("Conflito de eISSN '%s' ao atualizar venue ID %s. Ignorando.", parsed["eissn"], venue_id)
+            log.warning("eISSN conflict '%s' updating venue ID %s. Ignoring.", parsed["eissn"], venue_id)
 
     if parsed.get("scopus_id") and not as_clean_string(existing.get("scopus_id")):
         conflict_id = find_conflict_id_by_unique_field(cursor, "scopus_id", parsed["scopus_id"], venue_id)
@@ -781,7 +588,7 @@ def build_updates_for_existing(
         elif merge_if_conflict(conflict_id, "scopus_id"):
             pass
         else:
-            log.warning("Conflito de scopus_id '%s' ao atualizar venue ID %s. Ignorando.", parsed["scopus_id"], venue_id)
+            log.warning("scopus_id conflict '%s' updating venue ID %s. Ignoring.", parsed["scopus_id"], venue_id)
 
     if publisher_id and existing.get("publisher_id") is None:
         add_assign("publisher_id", publisher_id)
@@ -1093,17 +900,17 @@ def process_scopus_venues(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Ingest de venues Scopus para tabela venues.")
-    parser.add_argument("--json-dir", required=True, help="Diretório com arquivos JSON da Scopus.")
-    parser.add_argument("--limit", type=int, default=None, help="Limite de arquivos JSON.")
-    parser.add_argument("--commit-batch", type=int, default=200, help="Commit a cada N alterações (0 = commit por alteração).")
-    parser.add_argument("--dry-run", action="store_true", help="Executa sem gravar no banco.")
-    parser.add_argument("--no-merge-duplicates", action="store_true", help="Desativa unificação automática quando houver conflito de chave única.")
-    parser.add_argument("--prefer-db-merge-procedure", action="store_true", help="Tenta usar sp_merge_single_venue_pair antes do fallback Python.")
+    parser = argparse.ArgumentParser(description="Load Scopus venue metadata into the database.")
+    parser.add_argument("--json-dir", required=True, help="Directory with Scopus JSON files.")
+    parser.add_argument("--limit", type=int, default=None, help="Max JSON files to process.")
+    parser.add_argument("--commit-batch", type=int, default=200, help="Commit every N changes (0 = per change).")
+    parser.add_argument("--dry-run", action="store_true", help="Simulate without writing to DB.")
+    parser.add_argument("--no-merge-duplicates", action="store_true", help="Disable auto-merge on unique constraint conflict.")
+    parser.add_argument("--prefer-db-merge-procedure", action="store_true", help="Try sp_merge_single_venue_pair before Python fallback.")
     args = parser.parse_args()
 
     if not os.path.isdir(args.json_dir):
-        raise FileNotFoundError(f"Diretório não encontrado: {args.json_dir}")
+        raise FileNotFoundError(f"Directory not found: {args.json_dir}")
 
     json_files = collect_json_files(args.json_dir, args.limit)
     if not json_files:

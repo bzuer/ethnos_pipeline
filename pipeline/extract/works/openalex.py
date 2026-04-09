@@ -1,27 +1,28 @@
 
 """
-Fetch work metadata from the OpenAlex API for a list of DOIs.
+Fetch work metadata from the OpenAlex API for missing DOIs.
 
-Input:  a directory of .txt files (one DOI per line), typically produced by
-        missing_dois.py.  Each file is named after a venue/entity.
+Input:  works/doi/missing/ directory with per-ISSN subdirs containing
+        per-year .txt files (one DOI per line), produced by missing_dois.py.
 
-Output: works/openalex/{entity}/{sanitized_doi}.json
+Output: works/openalex/{issn}/{sanitized_doi}.json
+
+Primary strategy: bulk venue+year fetch (up to 200 works per API call).
+Fallback: individual DOI fetch for unmatched DOIs.
 """
 
 import argparse
 import sys
 import os
-import json
-import time
 import logging
 import httpx
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-from pipeline.extract.common import (
-    read_config, load_dois_from_file, sanitize_doi_for_filename,
-    parse_entity_from_filename,
-)
+from pipeline.extract.config import read_config, set_config
+from pipeline.extract.retry import retry_request
+from pipeline.extract.http import create_client
+from pipeline.extract.io_utils import sanitize_doi_for_filename, discover_issns, record_not_found_doi
+from pipeline.extract.works_common import save_work, process_issn_generic, EXCLUDED_WORK_TYPES
+from pipeline.extract.common import resolve_openalex_source_id
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,98 +32,129 @@ logging.basicConfig(
         logging.StreamHandler(),
     ]
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-BASE_API_URL = "https://api.openalex.org/works/"
+BULK_API_URL = "https://api.openalex.org/works"
+SINGLE_API_URL = "https://api.openalex.org/works/"
 CACHE_DIR = "works/openalex"
 
-EXCLUDED_TYPES = {
-    'editorial', 'erratum', 'corrigendum', 'note', 'letter',
-    'retraction', 'publisher-note', 'book-review', 'errata',
-    'acknowledgments', 'journal-issue',
-}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_oa_doi(raw: str) -> str:
+    """Normalize an OpenAlex DOI field (URL form) to bare lowercase DOI."""
+    if not raw:
+        return ''
+    raw = raw.strip().lower()
+    for prefix in ('https://doi.org/', 'http://doi.org/'):
+        if raw.startswith(prefix):
+            return raw[len(prefix):]
+    return raw
 
 
-def fetch_and_save(client: httpx.Client, doi: str, entity_dir: str) -> str:
+def _save_oa_work(work: dict, doi: str, entity_dir: str, tag: str) -> str:
+    return save_work(work, doi, entity_dir, tag, ensure_ascii=False, indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Bulk fetch: all works for a venue+year
+# ---------------------------------------------------------------------------
+
+def fetch_venue_year(client: httpx.Client, source_id: str, year: str,
+                     per_page: int = 200, page_pause: float = 0.1) -> list:
+    """Fetch all works for a venue+year via paginated bulk API call."""
+    import time
+    all_works = []
+    page = 1
+
+    while True:
+        params = {
+            'filter': f'primary_location.source.id:{source_id},publication_year:{year}',
+            'per_page': per_page,
+            'page': page,
+        }
+
+        def _attempt():
+            resp = client.get(BULK_API_URL, params=params)
+            if resp.status_code == 200:
+                return 'success', resp.json()
+            if resp.status_code == 429:
+                return 'retry_429', None
+            return 'retry', None
+
+        data = retry_request(_attempt, label=f"source:{source_id} year:{year} p{page}")
+        if data is None:
+            return all_works
+
+        results = data.get('results', [])
+        all_works.extend(results)
+        meta = data.get('meta', {})
+        logging.info(f"  year {year}: {len(results)} works (total: {meta.get('count', '?')})")
+
+        if len(results) < per_page:
+            return all_works
+        page += 1
+        time.sleep(page_pause)
+
+    return all_works
+
+
+# ---------------------------------------------------------------------------
+# Individual DOI fetch (fallback)
+# ---------------------------------------------------------------------------
+
+_NOT_FOUND = object()
+
+
+def fetch_single_doi(client: httpx.Client, doi: str, entity_dir: str) -> str:
+    """Fetch a single DOI from OpenAlex and save to cache."""
     safe = sanitize_doi_for_filename(doi)
     output_file = os.path.join(entity_dir, f"{safe}.json")
-
     if os.path.exists(output_file):
-        return 'skipped'
+        return 'Cached'
 
-    url = f"{BASE_API_URL}https://doi.org/{doi}"
-    try:
+    url = f"{SINGLE_API_URL}https://doi.org/{doi}"
+
+    def _attempt():
         response = client.get(url)
+        if response.status_code == 200:
+            return 'success', response.json()
         if response.status_code == 404:
-            logging.warning(f"DOI not found on OpenAlex: {doi}")
-            return 'failed'
-        if response.status_code != 200:
-            logging.error(f"HTTP {response.status_code} for {doi}")
-            return 'failed'
+            return 'not_found', _NOT_FOUND
+        if response.status_code == 429:
+            return 'retry_429', None
+        return 'retry', None
 
-        data = response.json()
-        if data.get('type') in EXCLUDED_TYPES:
-            logging.info(f"Filtered {doi} (type: {data.get('type')})")
-            return 'filtered'
+    data = retry_request(_attempt, label=doi)
+    if data is _NOT_FOUND:
+        logging.info(f"{doi} -> not found (404)")
+        record_not_found_doi(entity_dir, doi)
+        return 'Not Found'
+    if data is None:
+        logging.error(f"{doi} -> failed")
+        return 'Failed'
 
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        return 'success'
-
-    except Exception as e:
-        logging.error(f"Error fetching {doi}: {e}")
-        return 'failed'
+    return _save_oa_work(data, doi, entity_dir, tag='')
 
 
-def process_entity(client: httpx.Client, input_dir: str, filename: str,
-                   workers: int, batch_size: int, pause: float):
-    entity_name = parse_entity_from_filename(filename)
-    if not entity_name:
-        logging.warning(f"Cannot parse entity from '{filename}'. Skipping.")
-        return
-
-    entity_dir = os.path.join(CACHE_DIR, entity_name)
-    os.makedirs(entity_dir, exist_ok=True)
-
-    filepath = os.path.join(input_dir, filename)
-    dois = list(load_dois_from_file(filepath))
-    if not dois:
-        logging.info(f"No DOIs in '{filename}'. Skipping.")
-        return
-
-    logging.info(f"--- Entity: {entity_name} | {len(dois)} unique DOIs ---")
-
-    for i in range(0, len(dois), batch_size):
-        batch = dois[i:i + batch_size]
-        batch_num = (i // batch_size) + 1
-        total_batches = (len(dois) + batch_size - 1) // batch_size
-
-        logging.info(f"Batch {batch_num}/{total_batches} ({len(batch)} DOIs) for {entity_name}")
-
-        results = {'success': 0, 'skipped': 0, 'failed': 0, 'filtered': 0}
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(fetch_and_save, client, doi, entity_dir): doi
-                for doi in batch
-            }
-            for future in as_completed(futures):
-                status = future.result()
-                results[status] = results.get(status, 0) + 1
-
-        logging.info(f"Batch {batch_num} done: {results}")
-        if batch_num < total_batches:
-            time.sleep(pause)
-
-    logging.info(f"--- Done: {entity_name} ---")
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fetch work metadata from OpenAlex for DOI lists."
+        description="Fetch work metadata from OpenAlex for missing DOIs (bulk by venue+year)."
     )
     parser.add_argument("input_dir",
-                        help="Directory with .txt files of DOIs (one per line).")
+                        help="Directory with per-ISSN subdirs of missing DOIs (works/doi/missing).")
     parser.add_argument("--config", default="config.ini",
                         help="Path to config.ini.")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-fetch even if entity output dir already exists.")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Max ISSNs to process (0 = unlimited).")
     args = parser.parse_args()
 
     if not os.path.isdir(args.input_dir):
@@ -130,22 +162,64 @@ def main():
         sys.exit(1)
 
     config = read_config(args.config)
+    set_config(config)
     email = config.get('api', 'email', fallback='anonymous@example.com')
+
     workers = config.getint('openalex', 'workers', fallback=1)
-    batch_size = config.getint('openalex', 'batch_size', fallback=100_000_000)
-    pause = config.getfloat('openalex', 'pause_between_batches', fallback=1.0)
+    batch_size = config.getint('openalex', 'batch_size', fallback=0)
+    pause = config.getfloat('openalex', 'pause_between_batches', fallback=0)
 
     os.makedirs(CACHE_DIR, exist_ok=True)
+    logging.info(f"Output: {CACHE_DIR}/ | {workers} workers, batch_size={batch_size}, pause={pause}s")
+    logging.info(f"Excluded types: {', '.join(sorted(EXCLUDED_WORK_TYPES))}")
 
-    limits = httpx.Limits(max_keepalive_connections=workers + 5, max_connections=workers + 10)
-    headers = {"User-Agent": f"DataCollector/4.0 (mailto:{email})"}
+    issns = discover_issns(args.input_dir, args.limit)
+    logging.info(f"Processing {len(issns)} ISSNs from {args.input_dir}")
 
-    with httpx.Client(timeout=30.0, headers=headers, limits=limits, follow_redirects=True) as client:
-        for filename in sorted(os.listdir(args.input_dir)):
-            if filename.endswith('.txt'):
-                process_entity(client, args.input_dir, filename, workers, batch_size, pause)
+    # Single DB connection for resolve_openalex_source_id across all ISSNs
+    db_conn = None
+    try:
+        from pipeline.common import get_connection
+        db_conn = get_connection()
+    except Exception as e:
+        logging.warning(f"Could not open DB connection for source ID resolution: {e}")
 
-    logging.info("All entities processed.")
+    try:
+        with create_client(config, workers=workers) as client:
+            for i, issn in enumerate(issns, 1):
+                source_id_holder = [None]
+
+                def _pre_bulk():
+                    sid = resolve_openalex_source_id(issn, http_client=client, conn=db_conn)
+                    source_id_holder[0] = sid
+                    if not sid:
+                        logging.warning(f"[{issn}] no OpenAlex source ID — all DOIs go to individual fallback")
+                        return False
+                    return True
+
+                process_issn_generic(
+                    issn, args.input_dir, CACHE_DIR, args.force,
+                    bulk_fetch_fn=lambda year, _missing, _c=client:
+                        fetch_venue_year(_c, source_id_holder[0], year),
+                    doi_extractor=lambda w: _normalize_oa_doi(w.get('doi')),
+                    save_fn=_save_oa_work,
+                    single_fetch_fn=lambda doi, edir, _c=client:
+                        fetch_single_doi(_c, doi, edir),
+                    pre_bulk_hook=_pre_bulk,
+                    workers=workers,
+                    batch_size=batch_size,
+                    pause_between_batches=pause,
+                )
+                if i % 50 == 0:
+                    logging.info(f"Progress: {i}/{len(issns)} ISSNs")
+    finally:
+        if db_conn is not None:
+            try:
+                db_conn.close()
+            except Exception:
+                pass
+
+    logging.info("All ISSNs processed.")
 
 
 if __name__ == "__main__":

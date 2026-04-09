@@ -1,27 +1,9 @@
 
 """
-populate_from_crossref_gem_v4.1.py (Ajustado)
+Load Crossref work metadata from JSON files into the database.
 
-Versão do script Crossref (originalmente v2.7.1) atualizada para o
-novo esquema do banco de dados (onde identificadores foram movidos
-de 'works' para 'publications').
-
-Modificações v4.1 (Correções de Lógica e Schema):
-- **CORREÇÃO (Erro de Lógica):** Removida a lógica de `pmid`/`pmcid`
-  de `sync_publication_details` (linhas 620-642 da v4.0). Essa lógica
-  foi copiada incorretamente do script OpenAlex e não se aplica
-  aos dados da Crossref (que não fornece esses IDs nos campos esperados).
-
-Modificações v4.0 (Schema Refactor):
-- **Atualização de `sync_work_details`**:
-  - Removida a lógica de atualização para `pmid`, `pmcid`, e `url`,
-    pois estes campos não existem mais na tabela `works`.
-  - Mantida a lógica para `subtitle`, `abstract` e `language`.
-- **Atualização de `sync_publication_details`**:
-  - (Lógica de PMID/PMCID da v4.0 revertida na v4.1 por ser incorreta).
-
-REQUISITO: O banco de dados DEVE ter a coluna `persons.normalized_name`
-mantida pela função `clean_person_name` (v3.3) e seus TRIGGERS.
+Input:  works/crossref/{issn}/{doi}.json  (Crossref envelope format)
+Output: works, publications, authorships, funding, work_subjects, work_references, files tables.
 """
 import os
 import sys
@@ -36,38 +18,30 @@ from urllib.parse import urlparse, parse_qs
 from typing import Dict, Optional, List, Tuple
 from datetime import datetime
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-INGEST_DIR = os.path.dirname(SCRIPT_DIR)
-if INGEST_DIR not in sys.path:
-    sys.path.insert(0, INGEST_DIR)
-
-from common import (
-    LICENSE_VERSION_RANK,
-    build_cache,
-    clean_ingest_text,
-    classify_ingest_exclusion,
-    collect_json_files,
-    discover_input_folders,
-    ensure_connection,
-    extract_first_text,
-    format_iso_timestamp,
-    get_connection,
-    get_or_create_organization,
-    get_or_create_person,
-    get_or_create_subject,
-    get_or_create_venue,
-    normalize_doi,
-    normalize_language_code,
-    normalize_term_key,
-    safe_rollback,
+from pipeline.load.db import safe_rollback
+from pipeline.load.normalize import (
+    normalize_doi, normalize_language_code, normalize_term_key,
+    clean_ingest_text, extract_first_text, format_iso_timestamp,
 )
+from pipeline.load.filtering import classify_ingest_exclusion
+from pipeline.load.entities import (
+    get_or_create_organization, get_or_create_person,
+    get_or_create_subject, get_or_create_venue,
+)
+from pipeline.load.constants import (
+    STATUS_INSERTED, STATUS_UPDATED, STATUS_NO_CHANGE,
+    STATUS_SKIPPED, STATUS_ERROR, LICENSE_VERSION_RANK,
+    ORG_TYPE_PUBLISHER, ORG_TYPE_INSTITUTE, ORG_TYPE_FUNDER,
+    VENUE_TYPE_JOURNAL, VENUE_TYPE_CONFERENCE,
+)
+from pipeline.load.runner import run_work_loader, add_work_loader_arguments
 
 
 try:
     MEMORY_LIMIT = 8 * 1024 * 1024 * 1024
     resource.setrlimit(resource.RLIMIT_AS, (MEMORY_LIMIT, MEMORY_LIMIT))
 except (ValueError, resource.error) as e:
-    logging.warning(f"Não foi possível definir o limite de memória: {e}")
+    logging.warning(f"Could not set memory limit: {e}")
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -76,12 +50,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 
-
-STATUS_INSERTED = "INSERTED"
-STATUS_UPDATED = "UPDATED"
-STATUS_NO_CHANGE = "NO_CHANGE"
-STATUS_SKIPPED = "SKIPPED"
-STATUS_ERROR = "ERROR"
 
 WORK_TYPE_MAP = {
     'journal-article': 'ARTICLE', 'article': 'ARTICLE', 'book-chapter': 'CHAPTER',
@@ -94,12 +62,6 @@ WORK_TYPE_MAP = {
     'erratum': 'OTHER', 'grant': 'OTHER', 'letter': 'OTHER', 'review': 'OTHER',
     'paratext': 'OTHER', 'other': 'OTHER',
 }
-ORG_TYPE_PUBLISHER = 'PUBLISHER'
-ORG_TYPE_INSTITUTE = 'INSTITUTE'
-ORG_TYPE_FUNDER = 'FUNDER'
-VENUE_TYPE_JOURNAL = 'JOURNAL'
-VENUE_TYPE_CONFERENCE = 'CONFERENCE'
-VENUE_TYPE_OTHER = 'OTHER' 
 
 
 def extract_publication_date(message: Dict) -> Optional[str]:
@@ -317,37 +279,13 @@ def get_crossref_exclusion_reason(message: Optional[Dict]) -> Optional[str]:
     title = clean_ingest_text(extract_first_text(message.get("title")))
     if not title:
         return "missing-title"
+    subtitle = clean_ingest_text(extract_first_text(message.get("subtitle")))
     return classify_ingest_exclusion(
         title,
         message.get("type"),
         source="crossref",
+        subtitle=subtitle,
     )
-
-
-def should_skip_existing_doi(
-    cursor: mariadb.Cursor,
-    doi: Optional[str],
-    mode: str,
-    doi_presence_cache: Dict[str, bool],
-) -> bool:
-    if mode != "new" or not doi:
-        return False
-    if doi in doi_presence_cache:
-        return doi_presence_cache[doi]
-    cursor.execute("SELECT 1 FROM publications WHERE doi = ? LIMIT 1", (doi,))
-    exists = cursor.fetchone() is not None
-    doi_presence_cache[doi] = exists
-    return exists
-
-
-def mark_doi_processed(
-    doi: Optional[str],
-    mode: str,
-    status: str,
-    doi_presence_cache: Dict[str, bool],
-) -> None:
-    if mode == "new" and doi and status in (STATUS_INSERTED, STATUS_UPDATED, STATUS_NO_CHANGE):
-        doi_presence_cache[doi] = True
 
 
 def sync_work_details(cursor: mariadb.Cursor, work_id: int, message: Dict) -> bool:
@@ -461,16 +399,20 @@ def sync_publication_details(cursor: mariadb.Cursor, publication_id: int, messag
         logging.error(f"PUB {publication_id} error=unexpected detail={e}")
         return False
 
-def sync_authorships(cursor: mariadb.Cursor, work_id: int, authors_from_json: List[Dict], cache: Dict[str, Dict]) -> bool:
-                                      
+def sync_authorships(cursor: mariadb.Cursor, work_id: int, authors_from_json: List[Dict], cache: Dict[str, Dict], is_new: bool = False) -> bool:
+
     if not authors_from_json: return False
     changes_made = False
-    try: 
-        cursor.execute("SELECT person_id, position FROM authorships WHERE work_id = ? AND role = 'AUTHOR'", (work_id,))
-        current_authors = {row[0]: row[1] for row in cursor.fetchall()}
-    except mariadb.Error as e: 
-        logging.error(f"WORK {work_id} error=authorships-select detail={e}")
-        return False
+
+    if is_new:
+        current_authors = {}
+    else:
+        try:
+            cursor.execute("SELECT person_id, position FROM authorships WHERE work_id = ? AND role = 'AUTHOR'", (work_id,))
+            current_authors = {row[0]: row[1] for row in cursor.fetchall()}
+        except mariadb.Error as e:
+            logging.error(f"WORK {work_id} error=authorships-select detail={e}")
+            return False
 
     authors_to_add = []; authors_to_update = []
     processed_person_ids = set()
@@ -522,22 +464,20 @@ def sync_authorships(cursor: mariadb.Cursor, work_id: int, authors_from_json: Li
          except mariadb.Error as e: logging.error(f"WORK {work_id} error=authorships-update detail={e}")
     if duplicate_author_entries:
         logging.debug(f"WORK {work_id}: skipped {duplicate_author_entries} duplicate author entries (same person_id)")
-    if changes_made:
-         try: 
-             cursor.callproc('sp_update_work_author_summary', (work_id,))
-         except mariadb.Error as e: 
-             logging.error(f"WORK {work_id} error=authorships-summary detail={e}")
     return changes_made
 
-def sync_funding(cursor: mariadb.Cursor, work_id: int, funders_from_json: List[Dict], cache: Dict[str, Dict]) -> bool:
-                                                        
+def sync_funding(cursor: mariadb.Cursor, work_id: int, funders_from_json: List[Dict], cache: Dict[str, Dict], is_new: bool = False) -> bool:
+
     if not funders_from_json: return False
-    try: 
-        cursor.execute("SELECT funder_id, grant_number FROM funding WHERE work_id = ?", (work_id,))
-        existing_funding = {(row[0], row[1]) for row in cursor.fetchall()}
-    except mariadb.Error as e: 
-        logging.error(f"WORK {work_id} error=funding-select detail={e}")
-        return False
+    if is_new:
+        existing_funding = set()
+    else:
+        try:
+            cursor.execute("SELECT funder_id, grant_number FROM funding WHERE work_id = ?", (work_id,))
+            existing_funding = {(row[0], row[1]) for row in cursor.fetchall()}
+        except mariadb.Error as e:
+            logging.error(f"WORK {work_id} error=funding-select detail={e}")
+            return False
     funders_to_add = []
     for funder_data in funders_from_json:
         funder_id = get_or_create_organization(cursor, funder_data.get('name'), ORG_TYPE_FUNDER, cache)
@@ -632,15 +572,18 @@ def sync_licenses(cursor: mariadb.Cursor, publication_id: int, licenses_from_jso
         logging.error(f"PUBLICATION {publication_id} error=licenses-update detail={e}")
         return False
 
-def sync_subjects(cursor: mariadb.Cursor, work_id: int, subjects_from_json: List[str], cache: Dict[str, Dict]) -> bool:
-                                                 
+def sync_subjects(cursor: mariadb.Cursor, work_id: int, subjects_from_json: List[str], cache: Dict[str, Dict], is_new: bool = False) -> bool:
+
     if not subjects_from_json: return False
-    try: 
-        cursor.execute("SELECT s.term_key FROM work_subjects ws JOIN subjects s ON ws.subject_id = s.id WHERE ws.work_id = ? AND s.vocabulary = 'KEYWORD'", (work_id,))
-        existing_term_keys = {row[0] for row in cursor.fetchall()}
-    except mariadb.Error as e: 
-        logging.error(f"WORK {work_id} error=subjects-select detail={e}")
-        return False
+    if is_new:
+        existing_term_keys = set()
+    else:
+        try:
+            cursor.execute("SELECT s.term_key FROM work_subjects ws JOIN subjects s ON ws.subject_id = s.id WHERE ws.work_id = ? AND s.vocabulary = 'KEYWORD'", (work_id,))
+            existing_term_keys = {row[0] for row in cursor.fetchall()}
+        except mariadb.Error as e:
+            logging.error(f"WORK {work_id} error=subjects-select detail={e}")
+            return False
     
     subjects_to_add = []; processed_term_keys_in_batch = set()
     for term in subjects_from_json:
@@ -662,18 +605,14 @@ def sync_subjects(cursor: mariadb.Cursor, work_id: int, subjects_from_json: List
         try:
             cursor.executemany("INSERT IGNORE INTO work_subjects (work_id, subject_id) VALUES (?, ?)", subjects_to_add)
             if cursor.rowcount > 0:
-                try:
-                    cursor.callproc('sp_update_work_subjects_summary', (work_id,))
-                except mariadb.Error as e_sp:
-                    logging.error(f"WORK {work_id} error=subjects-summary detail={e_sp}")
                 logging.info(f"WORK {work_id}: linked {cursor.rowcount}/{len(subjects_to_add)} subjects")
                 return True
         except mariadb.Error as e:
             logging.error(f"WORK {work_id} error=subjects-insert detail={e}")
     return False
 
-def sync_citations(cursor: mariadb.Cursor, work_id: int, references: List[Dict]) -> bool:
-                                                                 
+def sync_citations(cursor: mariadb.Cursor, work_id: int, references: List[Dict], is_new: bool = False) -> bool:
+
     if not references: return False
     unique_cited_dois = {
         norm_doi
@@ -683,23 +622,25 @@ def sync_citations(cursor: mariadb.Cursor, work_id: int, references: List[Dict])
     }
     if not unique_cited_dois: return False
     try:
-        batch_size = 1000
-        dois_list = list(unique_cited_dois)
-        existing_dois = set()
-        for i in range(0, len(dois_list), batch_size):
-            batch_dois = dois_list[i:i + batch_size]
-            placeholders = ', '.join(['?'] * len(batch_dois))
-            params = (work_id, *batch_dois)
-            cursor.execute(
-                f"SELECT cited_doi FROM work_references WHERE citing_work_id = ? AND cited_doi IN ({placeholders})",
-                params,
-            )
-            for row in cursor.fetchall():
-                existing_norm = normalize_doi(row[0])
-                if existing_norm:
-                    existing_dois.add(existing_norm)
-
-        refs_to_add = [(work_id, doi[:255]) for doi in unique_cited_dois if doi not in existing_dois]
+        if is_new:
+            refs_to_add = [(work_id, doi[:255]) for doi in unique_cited_dois]
+        else:
+            batch_size = 1000
+            dois_list = list(unique_cited_dois)
+            existing_dois = set()
+            for i in range(0, len(dois_list), batch_size):
+                batch_dois = dois_list[i:i + batch_size]
+                placeholders = ', '.join(['?'] * len(batch_dois))
+                params = (work_id, *batch_dois)
+                cursor.execute(
+                    f"SELECT cited_doi FROM work_references WHERE citing_work_id = ? AND cited_doi IN ({placeholders})",
+                    params,
+                )
+                for row in cursor.fetchall():
+                    existing_norm = normalize_doi(row[0])
+                    if existing_norm:
+                        existing_dois.add(existing_norm)
+            refs_to_add = [(work_id, doi[:255]) for doi in unique_cited_dois if doi not in existing_dois]
         if not refs_to_add:
             return False
 
@@ -744,13 +685,15 @@ def _process_record_no_tx(
     if not clean_title:
         return STATUS_SKIPPED, None, None, doi
 
-    cursor.execute(
-        "SELECT p.work_id, p.id, w.title, w.work_type, w.abstract FROM publications p JOIN works w ON p.work_id = w.id WHERE p.doi = ?",
-        (doi,),
-    )
-    result = cursor.fetchone()
-    if result and mode == "new":
-        return STATUS_SKIPPED, None, None, doi
+    result = None
+    if mode != "fast":
+        cursor.execute(
+            "SELECT p.work_id, p.id, w.title, w.work_type, w.abstract FROM publications p JOIN works w ON p.work_id = w.id WHERE p.doi = ?",
+            (doi,),
+        )
+        result = cursor.fetchone()
+        if result and mode == "new":
+            return STATUS_SKIPPED, None, None, doi
 
     if result:
         work_id, publication_id, current_title, current_work_type, current_abstract = result
@@ -764,7 +707,7 @@ def _process_record_no_tx(
         updates = []
         params = []
         data_changed = False
-        if (not current_title or current_title == "Título Indisponível") and json_title:
+        if (not current_title or current_title == "Title Unavailable") and json_title:
             updates.append("title = ?")
             params.append(json_title)
         if (not current_work_type or current_work_type == "OTHER") and (json_work_type and json_work_type != "OTHER"):
@@ -820,11 +763,11 @@ def _process_record_no_tx(
 
     sync_work_details(cursor, work_id, message)
     sync_publication_details(cursor, publication_id, message, cache)
-    sync_authorships(cursor, work_id, message.get("author") or [], cache)
-    sync_citations(cursor, work_id, message.get("reference") or [])
-    sync_funding(cursor, work_id, message.get("funder") or [], cache)
+    sync_authorships(cursor, work_id, message.get("author") or [], cache, is_new=True)
+    sync_citations(cursor, work_id, message.get("reference") or [], is_new=True)
+    sync_funding(cursor, work_id, message.get("funder") or [], cache, is_new=True)
     sync_licenses(cursor, publication_id, message.get("license") or [])
-    sync_subjects(cursor, work_id, message.get("subject") or [], cache)
+    sync_subjects(cursor, work_id, message.get("subject") or [], cache, is_new=True)
     sync_crossref_files(cursor, publication_id, message)
 
     logging.info(
@@ -833,14 +776,14 @@ def _process_record_no_tx(
     return STATUS_INSERTED, work_id, publication_id, doi
 
 
-def process_record(
-    conn: mariadb.Connection,
-    filepath: str,
-    message: Optional[Dict],
-    doi: Optional[str],
-    mode: str,
-    cache: Dict[str, Dict],
-) -> str:
+def _crossref_process_no_tx_adapter(cursor, filepath, message, doi, mode, cache):
+    """Adapter: runner expects status only; _process_record_no_tx returns tuple."""
+    status, _, _, _ = _process_record_no_tx(cursor, filepath, message, doi, mode, cache)
+    return status
+
+
+def _crossref_process_per_file(conn, filepath, message, doi, mode, cache):
+    """Per-file transaction wrapper for runner's per-file mode."""
     cursor = None
     try:
         cursor = conn.cursor()
@@ -867,219 +810,17 @@ def process_record(
                 pass
 
 
-def main(args):
-    conn = None
-    total_processed_files = 0
-    total_inserted = 0
-    total_updated = 0
-    total_validated = 0
-    total_skipped = 0
-    total_errors = 0
-    script_start_time = datetime.now()
-    try:
-        root_dir = args.directory
-        subdirectories = discover_input_folders(root_dir)
-        if not subdirectories:
-            return
-
-        conn = get_connection(args.config)
-        logging.info(f"Ingest mode: {args.mode}")
-        doi_presence_cache: Dict[str, bool] = {}
-
-        cache_reset_interval = args.cache_reset_interval or 0
-
-        for subdir_path in subdirectories:
-            folder_name = os.path.basename(subdir_path)
-            cache = build_cache()
-            all_json_files = collect_json_files(subdir_path, args.limit)
-            total_files_in_folder = len(all_json_files)
-            logging.info(f"Processing {total_files_in_folder} files in {folder_name}...")
-            if args.commit_batch and args.commit_batch > 0:
-                folder_commit_batch = max(1, min(args.commit_batch, total_files_in_folder or 1))
-                logging.info(f"COMMIT mode=fixed folder={folder_name} batch={folder_commit_batch}")
-            else:
-                folder_commit_batch = max(1, total_files_in_folder)
-                logging.info(f"COMMIT mode=per-folder folder={folder_name} batch={folder_commit_batch}")
-
-            if folder_commit_batch > 1:
-                batch_count = 0
-                conn.begin()
-                cursor = conn.cursor()
-                for k, filepath in enumerate(all_json_files, 1):
-                    if k % 500 == 0:
-                        logging.info(f"FILE progress {k}/{total_files_in_folder}")
-                    if cache_reset_interval and k % cache_reset_interval == 0:
-                        cache = build_cache()
-                        logging.info(f"CACHE reset interval={cache_reset_interval} folder={folder_name}")
-
-                    message, doi, parse_status = parse_crossref_file(filepath)
-                    if parse_status:
-                        if parse_status == STATUS_SKIPPED:
-                            total_skipped += 1
-                        else:
-                            total_errors += 1
-                        continue
-                    if get_crossref_exclusion_reason(message):
-                        total_skipped += 1
-                        continue
-                    if should_skip_existing_doi(cursor, doi, args.mode, doi_presence_cache):
-                        total_skipped += 1
-                        continue
-
-                    was_open = conn.open
-                    savepoint_name = f"sp_{k}"
-                    force_reconnect = False
-                    transaction_reset = False
-                    try:
-                        cursor.execute(f"SAVEPOINT {savepoint_name}")
-                        status, _, _, _ = _process_record_no_tx(cursor, filepath, message, doi, args.mode, cache)
-                        if status == STATUS_ERROR:
-                            try:
-                                cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
-                            except mariadb.Error as e:
-                                logging.error(f"FILE {os.path.basename(filepath)} rollback failed: {e}")
-                                if safe_rollback(conn, f"FILE {os.path.basename(filepath)}"):
-                                    transaction_reset = True
-                                else:
-                                    force_reconnect = True
-                        else:
-                            cursor.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-                    except mariadb.IntegrityError as ie:
-                        try:
-                            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
-                        except mariadb.Error as e:
-                            logging.error(f"FILE {os.path.basename(filepath)} rollback failed: {e}")
-                            if safe_rollback(conn, f"FILE {os.path.basename(filepath)}"):
-                                transaction_reset = True
-                            else:
-                                force_reconnect = True
-                        logging.error(f"FILE {os.path.basename(filepath)} error=IntegrityError detail={ie}")
-                        status = STATUS_ERROR
-                    except (mariadb.Error, Exception) as e:
-                        try:
-                            cursor.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
-                        except mariadb.Error as re_err:
-                            logging.error(f"FILE {os.path.basename(filepath)} rollback failed: {re_err}")
-                            if safe_rollback(conn, f"FILE {os.path.basename(filepath)}"):
-                                transaction_reset = True
-                            else:
-                                force_reconnect = True
-                        logging.error(f"FILE {os.path.basename(filepath)} error={e}")
-                        status = STATUS_ERROR
-
-                    if force_reconnect or transaction_reset or (not conn.open and was_open):
-                        try:
-                            cursor.close()
-                        except mariadb.Error:
-                            pass
-                        conn = ensure_connection(conn, args.config)
-                        conn.begin()
-                        cursor = conn.cursor()
-                        if force_reconnect or transaction_reset:
-                            batch_count = 0
-
-                    batch_count += 1
-                    if batch_count >= folder_commit_batch:
-                        conn.commit()
-                        conn.begin()
-                        batch_count = 0
-
-                    if status == STATUS_INSERTED:
-                        total_inserted += 1
-                    elif status == STATUS_UPDATED:
-                        total_updated += 1
-                    elif status == STATUS_NO_CHANGE:
-                        total_validated += 1
-                    elif status == STATUS_SKIPPED:
-                        total_skipped += 1
-                    elif status == STATUS_ERROR:
-                        total_errors += 1
-                    mark_doi_processed(doi, args.mode, status, doi_presence_cache)
-
-                if batch_count > 0:
-                    conn.commit()
-                try:
-                    cursor.close()
-                except mariadb.Error:
-                    pass
-            else:
-                check_cursor = conn.cursor()
-                for k, filepath in enumerate(all_json_files, 1):
-                    if k % 500 == 0:
-                        logging.info(f"FILE progress {k}/{total_files_in_folder}")
-                    if cache_reset_interval and k % cache_reset_interval == 0:
-                        cache = build_cache()
-                        logging.info(f"CACHE reset interval={cache_reset_interval} folder={folder_name}")
-
-                    message, doi, parse_status = parse_crossref_file(filepath)
-                    if parse_status:
-                        if parse_status == STATUS_SKIPPED:
-                            total_skipped += 1
-                        else:
-                            total_errors += 1
-                        continue
-                    if get_crossref_exclusion_reason(message):
-                        total_skipped += 1
-                        continue
-                    if should_skip_existing_doi(check_cursor, doi, args.mode, doi_presence_cache):
-                        total_skipped += 1
-                        continue
-
-                    was_open = conn.open
-                    status = process_record(conn, filepath, message, doi, args.mode, cache)
-                    if not conn.open and was_open:
-                        conn = ensure_connection(conn, args.config)
-                        try:
-                            check_cursor.close()
-                        except mariadb.Error:
-                            pass
-                        check_cursor = conn.cursor()
-
-                    if status == STATUS_INSERTED:
-                        total_inserted += 1
-                    elif status == STATUS_UPDATED:
-                        total_updated += 1
-                    elif status == STATUS_NO_CHANGE:
-                        total_validated += 1
-                    elif status == STATUS_SKIPPED:
-                        total_skipped += 1
-                    elif status == STATUS_ERROR:
-                        total_errors += 1
-                    mark_doi_processed(doi, args.mode, status, doi_presence_cache)
-                try:
-                    check_cursor.close()
-                except mariadb.Error:
-                    pass
-
-            total_processed_files += total_files_in_folder
-            cache = build_cache()
-            logging.info(f"CACHE reset (end) folder={folder_name}")
-
-    except Exception as e:
-        logging.critical(f"Critical main execution failure: {e}", exc_info=True)
-    finally:
-        if conn and conn.open:
-            conn.close()
-        logging.info(
-            f"Total time: {(datetime.now() - script_start_time).total_seconds():.2f} sec. "
-            f"Processed {total_processed_files} files."
-        )
-        logging.info(
-            "Summary: "
-            f"Inserted={total_inserted}, Updated={total_updated}, Validated={total_validated}, "
-            f"Skipped={total_skipped}, Errors={total_errors}"
-        )
-
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
         description="Ingest records from Crossref JSON files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("directory", help="Root directory with subfolders (or the directory itself) containing .json files.")
-    parser.add_argument("--mode", choices=["new", "full"], default="new", help="Ingest mode: only new DOIs or all records.")
-    parser.add_argument("--limit", type=int, help="Limits the total number of records (new + existing) processed per folder.")
-    parser.add_argument("--commit-batch", type=int, default=0, help="Commit every N files. Use 0 to commit once per subfolder.")
-    parser.add_argument("--cache-reset-interval", type=int, default=5000, help="Reset in-memory cache every N files (0 to disable).")
-    parser.add_argument("--config", type=str, help="Path to config.ini (defaults to script dir or repo root).")
+    add_work_loader_arguments(parser)
     args = parser.parse_args()
-    main(args)
+    run_work_loader(
+        args,
+        parse_file=parse_crossref_file,
+        get_exclusion_reason=get_crossref_exclusion_reason,
+        process_record_no_tx=_crossref_process_no_tx_adapter,
+        process_record_per_file=_crossref_process_per_file,
+    )

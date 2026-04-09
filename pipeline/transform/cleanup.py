@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-Limpeza e normalização unificada do banco de dados.
+Unified database text cleanup and normalization.
 
-Fases (executadas na ordem):
-  text            – Limpeza textual (HTML, controles, Unicode, bordas).
-  sentinel        – Converte placeholders (none, null, n/a) para NULL.
-  identifiers     – Normaliza DOI, ORCID, ISSN, ISBN.
-  title_subtitle  – Separa works.title em title + subtitle no primeiro ":".
-  capitalization  – Corrige ALL CAPS → title case, all lower → sentence case.
+Phases (executed in order):
+  text            – Text cleanup (HTML, control chars, Unicode, edge trimming).
+  sentinel        – Convert placeholders (none, null, n/a) to SQL NULL.
+  identifiers     – Normalize DOI, ORCID, ISSN, ISBN.
+  title_subtitle  – Split works.title into title + subtitle on first ":".
+  capitalization  – Fix ALL CAPS → title case, all lower → sentence case.
 
-Uso:
-  python cleanup.py                                         # perfil + todas as fases
-  python cleanup.py --mode profile                          # apenas perfil
-  python cleanup.py --mode run                              # todas as fases
-  python cleanup.py --phase text --table works              # text só em works
+Usage:
+  python cleanup.py                                         # profile + all phases
+  python cleanup.py --mode profile                          # profile only
+  python cleanup.py --mode run                              # all phases
+  python cleanup.py --phase text --table works              # text on works only
   python cleanup.py --phase text --table organizations --column name
-  python cleanup.py --dry-run                               # simula sem gravar
+  python cleanup.py --dry-run                               # simulate without writing
 """
 import argparse
 import html
@@ -274,7 +274,7 @@ def get_database_name(conn: mariadb.Connection) -> str:
     name = cur.fetchone()[0]
     cur.close()
     if not name:
-        raise RuntimeError("Nenhum schema selecionado na conexão.")
+        raise RuntimeError("No schema selected on connection.")
     return name
 
 
@@ -569,7 +569,7 @@ def run_text_phase(
     log.info("=== Fase: text ===")
     targets = discover_target_columns(conn, include_tables, include_columns)
     if not targets:
-        log.info("Nenhuma coluna alvo.")
+        log.info("No target columns.")
         return ColumnStats()
 
     total = ColumnStats()
@@ -617,7 +617,7 @@ def run_sentinel_phase(
         if not t["is_pk_column"]
     ]
     if not targets:
-        log.info("Nenhuma coluna alvo.")
+        log.info("No target columns.")
         return ColumnStats()
 
     total = ColumnStats()
@@ -757,7 +757,7 @@ def run_identifier_phase(
 # ---------------------------------------------------------------------------
 
 def print_profile(conn: mariadb.Connection) -> None:
-    log.info("=== Perfil do Database ===")
+    log.info("=== Database Profile ===")
     log.info(f"schema: {get_database_name(conn)}")
 
     cur = conn.cursor()
@@ -790,9 +790,9 @@ def print_profile(conn: mariadb.Connection) -> None:
         ("work_references.cited_doi upper",
          "SELECT COUNT(*) FROM work_references WHERE cited_doi IS NOT NULL "
          "AND BINARY cited_doi <> BINARY LOWER(cited_doi)"),
-        ("venues.issn sem hífen",
+        ("venues.issn without hyphen",
          "SELECT COUNT(*) FROM venues WHERE issn IS NOT NULL AND issn REGEXP '^[0-9Xx]{8}$'"),
-        ("venues.eissn sem hífen",
+        ("venues.eissn without hyphen",
          "SELECT COUNT(*) FROM venues WHERE eissn IS NOT NULL AND eissn REGEXP '^[0-9Xx]{8}$'"),
         ("works.title with : and no subtitle",
          "SELECT COUNT(*) FROM works WHERE title LIKE '%:%' AND subtitle IS NULL"),
@@ -1016,13 +1016,13 @@ ALL_PHASES = ["text", "sentinel", "identifiers", "title_subtitle", "capitalizati
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Limpeza e normalização unificada do banco de dados.",
+        description="Unified database text cleanup and normalization.",
     )
     p.add_argument("--config", type=str, help="Caminho para config.ini")
     p.add_argument("--mode", choices=["profile", "run", "both"], default="both")
     p.add_argument(
         "--phase", action="append", choices=ALL_PHASES,
-        help="Fase(s) para execução (default: todas).",
+        help="Phase(s) to execute (default: all).",
     )
     p.add_argument("--table", action="append", help="Filtrar tabela(s)")
     p.add_argument("--column", action="append", help="Filtrar coluna(s)")
@@ -1043,6 +1043,12 @@ def main() -> None:
     phases = args.phase or ALL_PHASES
 
     conn = get_connection(args.config)
+    cur = conn.cursor()
+    cur.execute(
+        "SET SESSION net_read_timeout=3600, net_write_timeout=3600, "
+        "tmp_table_size=536870912, max_heap_table_size=536870912"
+    )
+    cur.close()
     try:
         if args.mode in {"profile", "both"}:
             print_profile(conn)
@@ -1061,16 +1067,16 @@ def main() -> None:
                 grand.add(run_capitalization_phase(conn, args))
 
             log.info(
-                f"=== Resumo: scanned={grand.scanned} changed={grand.changed} "
+                f"=== Summary: scanned={grand.scanned} changed={grand.changed} "
                 f"updated={grand.updated} skip_integrity={grand.skipped_integrity} "
                 f"skip_empty={grand.skipped_empty} skip_shrink={grand.skipped_shrink} "
                 f"errors={grand.errors} elapsed={time.time() - started:.1f}s ==="
             )
             if grand.skipped_shrink > 0:
                 log.warning(
-                    "ATENÇÃO: %d valores foram rejeitados pelo shrink guard — "
-                    "verifique se alguma transformação está truncando texto "
-                    "indevidamente.", grand.skipped_shrink,
+                    "WARNING: %d values rejected by shrink guard — "
+                    "check if any transformation is truncating text "
+                    "inappropriately.", grand.skipped_shrink,
                 )
     finally:
         try:

@@ -1,21 +1,19 @@
 -- ============================================================================
--- SCRIPT DE PROCESSAMENTO UNIFICADO PARA A ENTIDADE 'PERSONS' (VERSÃO 4.0)
+-- Unified person processing script (v4.1)
 --
--- MUDANÇAS (v4.0):
---   - Etapa 5 substituída por sp_generate_person_signatures (cursor-based,
---     CHAR_LENGTH, hifens compostos preservados, partículas tiered).
---   - Adicionada Etapa 5b: sp_fix_person_name_parts (given_names/family_name
---     com reverse-locate para recuperação de casing original).
---   - CTE inline de assinaturas removido (lógica agora encapsulada nas
---     procedures, evitando divergência de regras).
---   - sp_populate_signatures substituída por lógica de upsert já embutida
---     em sp_generate_person_signatures.
+-- Phase 1: Cleanup & deduplication (regex name cleaning, normalized_name, external IDs)
+-- Phase 2: Signatures & name parts (sp_generate_person_signatures, sp_fix_person_name_parts)
+-- Phase 3: Metrics recalculation — handled by metrics.py --full (removed from this script)
+--
+-- Run: mariadb data < pipeline/transform/persons_full_process.sql
+-- Requires: sp_merge_persons_in_batches, sp_generate_person_signatures, sp_fix_person_name_parts
+--           (defined in procedures.sql)
 -- ============================================================================
 
--- Configuração da RegEx de Limpeza (Centralizada)
+-- Title-prefix cleanup regex (centralized)
 SET @clean_regex = '(?i)^(dr\\.?|dra\\.?|prof\\.?|profa\\.?|professor\\.?|professora\\.?|ph\\.?d\\.?|msc\\.?|mr\\.?|mrs\\.?|ms\\.?|rev\\.?|eng\\.?|engª\\.?|me\\.?)\\s+';
 
--- Garantir existência das tabelas de staging
+-- Ensure staging tables exist
 CREATE TABLE IF NOT EXISTS temp_person_merge_pairs (
     primary_person_id INT(11) NOT NULL,
     secondary_person_id INT(11) NOT NULL,
@@ -32,11 +30,11 @@ CREATE TABLE IF NOT EXISTS staging_person_signatures (
 
 
 -- =====================================================================
--- FASE 1: LIMPEZA E DEDUPLICAÇÃO
+-- PHASE 1: CLEANUP & DEDUPLICATION
 -- =====================================================================
 
--- [ETAPA 1a] Pré-Deduplicação (lógica Regex)
-SELECT 'ETAPA 1a: Pré-Deduplicação (lógica Regex)...' AS status;
+-- [STEP 1a] Pre-deduplication (regex-based name cleaning)
+SELECT 'STEP 1a: Pre-deduplication (regex)...' AS status;
 TRUNCATE TABLE temp_person_merge_pairs;
 
 INSERT INTO temp_person_merge_pairs (primary_person_id, secondary_person_id)
@@ -68,8 +66,8 @@ FROM RankedNames
 WHERE id != primary_id
 ON DUPLICATE KEY UPDATE primary_person_id = LEAST(primary_person_id, VALUES(primary_person_id));
 
--- [ETAPA 1b] Pré-Deduplicação (coluna normalized_name)
-SELECT 'ETAPA 1b: Pré-Deduplicação (coluna normalized_name)...' AS status;
+-- [STEP 1b] Pre-deduplication (normalized_name column)
+SELECT 'STEP 1b: Pre-deduplication (normalized_name)...' AS status;
 INSERT IGNORE INTO temp_person_merge_pairs (primary_person_id, secondary_person_id)
 SELECT canonical.id, duplicate.id
 FROM persons AS duplicate
@@ -85,8 +83,8 @@ ON duplicate.normalized_name = canonical.normalized_name AND duplicate.id != can
 CALL sp_merge_persons_in_batches();
 
 
--- [ETAPA 2] Remoção de Registros Inválidos
-SELECT 'ETAPA 2: Removendo registros sintaticamente nulos...' AS status;
+-- [STEP 2] Remove invalid records (cleaned name <= 2 chars)
+SELECT 'STEP 2: Removing syntactically null records...' AS status;
 DELETE FROM persons
 WHERE LENGTH(
     TRIM(REGEXP_REPLACE(
@@ -100,8 +98,8 @@ WHERE LENGTH(
 ) <= 2;
 
 
--- [ETAPA 3] Limpeza Avançada (remoção de títulos, normalização)
-SELECT 'ETAPA 3: Remoção de títulos e normalização de espaçamento...' AS status;
+-- [STEP 3] Advanced cleanup (remove title prefixes, normalize spacing)
+SELECT 'STEP 3: Removing title prefixes, normalizing spacing...' AS status;
 UPDATE IGNORE persons
 SET preferred_name = TRIM(REGEXP_REPLACE(
     REPLACE(
@@ -116,8 +114,8 @@ WHERE preferred_name REGEXP @clean_regex
    OR preferred_name REGEXP '\\s{2,}';
 
 
--- [ETAPA 4] Deduplicação Final por Identificadores Externos
-SELECT 'ETAPA 4: Deduplicação por ORCID, Scopus, Lattes...' AS status;
+-- [STEP 4] Deduplication by external identifiers (ORCID, Scopus, Lattes)
+SELECT 'STEP 4: Deduplication by ORCID, Scopus, Lattes...' AS status;
 TRUNCATE TABLE temp_person_merge_pairs;
 
 -- ORCID
@@ -163,27 +161,20 @@ CALL sp_merge_persons_in_batches();
 
 
 -- =====================================================================
--- FASE 2: ASSINATURAS E PARTES DO NOME
+-- PHASE 2: SIGNATURES & NAME PARTS
 -- =====================================================================
 
--- [ETAPA 5a] Gerar assinaturas (cursor-based, CHAR_LENGTH, hifens
---            compostos preservados, partículas tiered, upsert em
---            signatures, vinculação de persons.signature_id)
-SELECT 'ETAPA 5a: Gerando assinaturas (sp_generate_person_signatures)...' AS status;
+-- [STEP 5a] Generate signatures (cursor-based, preserves compound hyphens, tiered particles)
+SELECT 'STEP 5a: Generating signatures (sp_generate_person_signatures)...' AS status;
 CALL sp_generate_person_signatures(NULL, 1);
 
--- [ETAPA 5b] Corrigir given_names / family_name (reverse-locate,
---            CHAR_LENGTH, mesma lógica de partículas)
-SELECT 'ETAPA 5b: Corrigindo given_names/family_name (sp_fix_person_name_parts)...' AS status;
+-- [STEP 5b] Fix given_names / family_name (reverse-locate for case recovery)
+SELECT 'STEP 5b: Fixing given_names/family_name (sp_fix_person_name_parts)...' AS status;
 CALL sp_fix_person_name_parts(NULL, 1);
 
 
--- =====================================================================
--- FASE 3: RECÁLCULO DE MÉTRICAS
--- =====================================================================
+-- PHASE 3: METRICS RECALCULATION
+-- Handled by: venv/bin/python pipeline/transform/metrics.py --full
+-- (sp_run_full_recalculation is obsolete — removed)
 
-SELECT 'ETAPA 6: Executando recálculo completo de métricas...' AS status;
-CALL sp_run_full_recalculation();
-
-
-SELECT 'PROCESSO UNIFICADO CONCLUÍDO (V4.0).' AS final_status;
+SELECT 'persons_full_process.sql completed.' AS final_status;

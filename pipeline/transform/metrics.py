@@ -29,20 +29,13 @@ Usage:
 
 import argparse
 import logging
-import os
-import sys
 import time
 from dataclasses import dataclass
 from typing import List
 
 import mariadb
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..'))
-
-try:
-    from pipeline.common import read_db_config, _prepare_connection_params
-except ModuleNotFoundError:
-    from common import read_db_config, _prepare_connection_params
+from pipeline.common import get_connection
 
 logging.basicConfig(
     level=logging.INFO,
@@ -53,14 +46,33 @@ log = logging.getLogger(__name__)
 
 
 def _get_connection(config_path=None):
-    """Like pipeline.common.get_connection but with longer timeouts for bulk ops."""
+    """get_connection with extended timeouts for bulk metric operations.
+
+    Overrides both client-side socket timeouts (read_timeout, write_timeout on
+    the connector) and server-side session variables so that heavy aggregation
+    queries like citation-count sync don't get killed mid-flight.
+    """
+    from pipeline.common import read_db_config, _prepare_connection_params
+
     db_config = read_db_config(config_path=config_path)
     params = _prepare_connection_params(db_config)
-    conn = mariadb.connect(**params, connect_timeout=30,
-                           read_timeout=3600, write_timeout=3600)
+
+    conn = mariadb.connect(
+        **params,
+        connect_timeout=30,
+        read_timeout=3600,
+        write_timeout=3600,
+    )
     conn.autocommit = False
+
     cur = conn.cursor()
     cur.execute("SET NAMES 'utf8mb4' COLLATE 'utf8mb4_uca1400_ai_ci'")
+    cur.execute(
+        "SET SESSION wait_timeout=28800, "
+        "net_read_timeout=3600, net_write_timeout=3600, "
+        "innodb_lock_wait_timeout=300, "
+        "tmp_table_size=536870912, max_heap_table_size=536870912"
+    )
     cur.close()
     return conn
 
@@ -463,10 +475,15 @@ SPHINX_PARTIAL: List[Step] = []
 # ---------------------------------------------------------------------------
 
 def execute_steps(conn: mariadb.Connection, steps: List[Step],
-                  section_label: str, dry_run: bool) -> None:
+                  section_label: str, dry_run: bool,
+                  config_path: str = None) -> mariadb.Connection:
+    """Execute a list of SQL steps, reconnecting on lost connections.
+
+    Returns the (possibly new) connection so the caller can continue.
+    """
     if not steps:
         log.info("=== %s — skipped (no steps for this mode) ===", section_label)
-        return
+        return conn
 
     total = len(steps)
     log.info("=== %s (%d steps) ===", section_label, total)
@@ -480,8 +497,8 @@ def execute_steps(conn: mariadb.Connection, steps: List[Step],
             continue
 
         t0 = time.time()
-        cur = conn.cursor()
         try:
+            cur = conn.cursor()
             cur.execute(step.sql)
             try:
                 while cur.nextset():
@@ -492,12 +509,37 @@ def execute_steps(conn: mariadb.Connection, steps: List[Step],
             affected = cur.rowcount
             elapsed = time.time() - t0
             log.info("  affected=%d elapsed=%.1fs", affected, elapsed)
+            cur.close()
+        except mariadb.InterfaceError as e:
+            log.warning("  Connection lost at step %s: %s — reconnecting", step.name, e)
+            try:
+                conn.close()
+            except mariadb.Error:
+                pass
+            conn = _get_connection(config_path)
+            # Retry the step once on the fresh connection
+            t0 = time.time()
+            cur = conn.cursor()
+            cur.execute(step.sql)
+            try:
+                while cur.nextset():
+                    pass
+            except mariadb.Error:
+                pass
+            conn.commit()
+            affected = cur.rowcount
+            elapsed = time.time() - t0
+            log.info("  affected=%d elapsed=%.1fs (after reconnect)", affected, elapsed)
+            cur.close()
         except mariadb.Error as e:
-            conn.rollback()
+            try:
+                conn.rollback()
+            except mariadb.Error:
+                pass
             log.error("  FAILED at step %s: %s", step.name, e)
             raise
-        finally:
-            cur.close()
+
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -546,34 +588,28 @@ def main() -> None:
 
     conn = _get_connection(args.config)
     try:
-        cur = conn.cursor()
-        cur.execute("SET SESSION wait_timeout=28800, "
-                    "net_read_timeout=3600, net_write_timeout=3600, "
-                    "innodb_lock_wait_timeout=300")
-        cur.close()
-
         mode_label = "full" if is_full else "partial"
         log.info("=== metrics %s ===", mode_label)
 
         if run_works:
             steps = WORKS_FULL if is_full else WORKS_PARTIAL
-            execute_steps(conn, steps, f"works ({mode_label})", args.dry_run)
+            conn = execute_steps(conn, steps, f"works ({mode_label})", args.dry_run, args.config)
 
         if run_persons:
             steps = PERSONS_FULL if is_full else PERSONS_PARTIAL
-            execute_steps(conn, steps, f"persons ({mode_label})", args.dry_run)
+            conn = execute_steps(conn, steps, f"persons ({mode_label})", args.dry_run, args.config)
 
         if run_orgs:
             steps = ORGANIZATIONS_FULL if is_full else ORGANIZATIONS_PARTIAL
-            execute_steps(conn, steps, f"organizations ({mode_label})", args.dry_run)
+            conn = execute_steps(conn, steps, f"organizations ({mode_label})", args.dry_run, args.config)
 
         if run_venues:
             steps = VENUES_FULL if is_full else VENUES_PARTIAL
-            execute_steps(conn, steps, f"venues ({mode_label})", args.dry_run)
+            conn = execute_steps(conn, steps, f"venues ({mode_label})", args.dry_run, args.config)
 
         if run_sphinx:
             steps = SPHINX_FULL if is_full else SPHINX_PARTIAL
-            execute_steps(conn, steps, f"sphinx ({mode_label})", args.dry_run)
+            conn = execute_steps(conn, steps, f"sphinx ({mode_label})", args.dry_run, args.config)
 
         elapsed = time.time() - started
         log.info("=== metrics complete — elapsed=%.1fs ===", elapsed)

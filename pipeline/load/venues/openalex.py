@@ -1,14 +1,8 @@
 """
-populate_venues_openalex.py
+Load OpenAlex venue metadata from JSON files into the database.
 
-Script para unificar, verificar e enriquecer venues a partir de arquivos JSON
-do OpenAlex.
-
-Regras de matching de venue:
-- Prioridade: ISSN/eISSN -> IDs (openalex/wikidata/mag) -> nome + tipo.
-
-Recuperação de conflitos de unicidade em INSERT:
-- openalex_id, wikidata_id, mag_id, issn/eissn, name+type.
+Venue matching priority: ISSN/eISSN -> IDs (openalex/wikidata/mag) -> name+type.
+Uniqueness conflict recovery: openalex_id, wikidata_id, mag_id, issn/eissn, name+type.
 """
 import os
 import sys
@@ -20,12 +14,13 @@ import re
 import csv
 from typing import Dict, Any, Optional, List, Tuple
 
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-INGEST_DIR = os.path.dirname(SCRIPT_DIR)
-if INGEST_DIR not in sys.path:
-    sys.path.insert(0, INGEST_DIR)
-
-from common import get_connection
+from pipeline.load.common import get_connection, normalize_issn
+from pipeline.load.venues.shared import (
+    VENUE_MERGE_UNIQUE_FIELDS, VENUE_MERGE_FILL_IF_NULL_FIELDS,
+    VENUE_MERGE_BOOL_MAX_FIELDS,
+    row_to_dict, find_conflict_id_by_unique_field, _get_venue_for_merge,
+    merge_venues_python_fallback,
+)
 
 
 logging.basicConfig(
@@ -57,22 +52,7 @@ VENUE_TYPE_MAP = {
     'other': 'OTHER'
 }
 
-VENUE_MERGE_UNIQUE_FIELDS = ("issn", "eissn", "scopus_id", "wikidata_id", "openalex_id", "mag_id")
-VENUE_MERGE_FILL_IF_NULL_FIELDS = (
-    "abbreviated_name",
-    "publisher_id",
-    "country_code",
-    "issn",
-    "eissn",
-    "homepage_url",
-    "aggregation_type",
-    "scopus_id",
-    "wikidata_id",
-    "openalex_id",
-    "scielo_id",
-    "mag_id",
-)
-VENUE_MERGE_BOOL_MAX_FIELDS = ("open_access", "is_in_doaj", "is_in_scielo", "is_indexed_in_scopus")
+# VENUE_MERGE_* constants imported from venues.shared
 
 
 def get_repo_root() -> str:
@@ -96,25 +76,6 @@ def extract_identifier(raw_value: Optional[str]) -> Optional[str]:
     return raw.strip() or None
 
 
-def normalize_issn(raw_value: Optional[str]) -> Optional[str]:
-    if raw_value is None:
-        return None
-    raw = str(raw_value).strip().upper().replace("-", "")
-    if not raw:
-        return None
-    if re.fullmatch(r"[0-9X]{8}", raw):
-        return f"{raw[:4]}-{raw[4:]}"
-    if re.fullmatch(r"[0-9X]{4}-[0-9X]{4}", str(raw_value).strip().upper()):
-        return str(raw_value).strip().upper()
-    return None
-
-
-def row_to_dict(cursor: mariadb.Cursor, row: Optional[tuple]) -> Optional[Dict[str, Any]]:
-    if not row:
-        return None
-    colnames = [d[0] for d in cursor.description]
-    return dict(zip(colnames, row))
-
 
 def get_or_create_publisher(cursor: mariadb.Cursor, publisher_name: str) -> Optional[int]:
                                                              
@@ -124,7 +85,7 @@ def get_or_create_publisher(cursor: mariadb.Cursor, publisher_name: str) -> Opti
     try:
         cursor.execute("SELECT id FROM organizations WHERE standardized_name = ?", (name_lower,))
         if result := cursor.fetchone(): publisher_id = result[0]
-    except mariadb.Error as e_std: log.error(f"Erro busca publisher '{name_stripped}': {e_std}"); return None
+    except mariadb.Error as e_std: log.error(f"Error looking up publisher '{name_stripped}': {e_std}"); return None
 
     if publisher_id: return publisher_id
 
@@ -134,13 +95,13 @@ def get_or_create_publisher(cursor: mariadb.Cursor, publisher_name: str) -> Opti
         log.debug(f"    -> Criado Publisher: '{name_stripped}', ID: {new_id}")
         return new_id
     except mariadb.IntegrityError:
-        log.warning(f"Conflito ao inserir publisher '{name_stripped}'. Buscando novamente.")
+        log.warning(f"Conflict inserting publisher '{name_stripped}'. Retrying lookup.")
         try:
             cursor.execute("SELECT id FROM organizations WHERE standardized_name = ?", (name_lower,))
             if result := cursor.fetchone(): return result[0]
             return None
-        except mariadb.Error as e_retry: log.error(f"Erro busca publisher '{name_stripped}' pós-conflito: {e_retry}"); return None
-    except mariadb.Error as e_ins: log.error(f"Erro DB insert publisher '{name_stripped}': {e_ins}"); return None
+        except mariadb.Error as e_retry: log.error(f"Error looking up publisher '{name_stripped}' post-conflict: {e_retry}"); return None
+    except mariadb.Error as e_ins: log.error(f"DB error inserting publisher '{name_stripped}': {e_ins}"); return None
 
 def normalize_term_key(term: str) -> str:
                                                                     
@@ -167,7 +128,7 @@ def get_or_create_subject_hierarchical(
     existing_parent_id = None
 
     if not term_key:
-        log.warning(f"Termo '{display_name}' ({openalex_id}) resultou em term_key vazio. Pulando.")
+        log.warning(f"Term '{display_name}' ({openalex_id}) resulted in empty term_key. Skipping.")
         return None
 
     try:
@@ -181,10 +142,10 @@ def get_or_create_subject_hierarchical(
                     cursor.execute("UPDATE subjects SET parent_id = ? WHERE id = ?", (parent_id, subject_db_id))
                     log.debug(f"    -> Parent ID atualizado para {parent_id} em Subject ID:{subject_db_id}")
                 except mariadb.Error as e_upd_p:
-                    log.error(f"    -> Erro ao atualizar Parent ID {subject_db_id} (via URI find): {e_upd_p}")
+                    log.error(f"    -> Error updating Parent ID {subject_db_id} (via URI find): {e_upd_p}")
             return subject_db_id
     except mariadb.Error as e_sel_uri:
-        log.error(f"Erro busca subject por URI '{openalex_id}': {e_sel_uri}")
+        log.error(f"Error looking up subject by URI '{openalex_id}': {e_sel_uri}")
 
     try: 
         cursor.execute("SELECT id, parent_id, external_uri FROM subjects WHERE vocabulary = ? AND subject_type = ? AND term_key = ?",
@@ -192,7 +153,7 @@ def get_or_create_subject_hierarchical(
         result = cursor.fetchone()
         if result:
             subject_db_id, existing_parent_id, existing_uri = result[0], result[1], result[2]
-            log.debug(f"    -> Encontrado Subject por Chave Única: '{display_name}' ID:{subject_db_id}")
+            log.debug(f"    -> Found Subject by unique key: '{display_name}' ID:{subject_db_id}")
             updates_needed = []
             params = []
             if existing_uri is None and openalex_id is not None:
@@ -208,13 +169,13 @@ def get_or_create_subject_hierarchical(
                     cursor.execute(f"UPDATE subjects SET {', '.join(updates_needed)} WHERE id = ?", tuple(params))
                     log.debug(f"    -> Dados faltantes atualizados em Subject ID:{subject_db_id} (via Key find)")
                 except mariadb.Error as e_upd_k:
-                    log.error(f"    -> Erro ao atualizar dados faltantes {subject_db_id} (via Key find): {e_upd_k}")
+                    log.error(f"    -> Error updating missing data for {subject_db_id} (via Key find): {e_upd_k}")
             return subject_db_id
     except mariadb.Error as e_sel_key:
-        log.error(f"Erro busca subject por Chave Única '{term_key}': {e_sel_key}")
+        log.error(f"Error looking up subject by unique key '{term_key}': {e_sel_key}")
 
     try:
-        log.debug(f"    -> Tentando inserir Subject: '{display_name}' ({source_vocabulary}/{subject_type_param}) Parent:{parent_id} URI:{openalex_id} Key:'{term_key}'")
+        log.debug(f"    -> Attempting to insert Subject: '{display_name}' ({source_vocabulary}/{subject_type_param}) Parent:{parent_id} URI:{openalex_id} Key:'{term_key}'")
         cursor.execute(
             """INSERT INTO subjects
                (term, vocabulary, subject_type, lang, external_uri, parent_id, term_key)
@@ -225,33 +186,33 @@ def get_or_create_subject_hierarchical(
         log.debug(f"    -> Criado Subject: '{display_name}' ({source_vocabulary}/{subject_type_param}), ID:{subject_db_id}, Parent:{parent_id}")
         return subject_db_id
     except mariadb.IntegrityError as e_integrity:
-        log.warning(f"    -> Conflito ao inserir Subject '{display_name}' ({openalex_id}). Tentando buscar novamente...")
+        log.warning(f"    -> Conflict inserting Subject '{display_name}' ({openalex_id}). Retrying lookup...")
         try:
             cursor.execute("SELECT id FROM subjects WHERE external_uri = ?", (openalex_id,))
             result = cursor.fetchone()
             if result:
-                log.debug(f"    -> Encontrado Subject ID:{result[0]} por URI após conflito.")
+                log.debug(f"    -> Found Subject ID:{result[0]} by URI after conflict.")
                 return result[0]
             else:
                 cursor.execute("SELECT id FROM subjects WHERE vocabulary = ? AND subject_type = ? AND term_key = ?",
                                (source_vocabulary, subject_type_param, term_key))
                 result = cursor.fetchone()
                 if result:
-                    log.debug(f"    -> Encontrado Subject ID:{result[0]} por Chave Única após conflito.")
+                    log.debug(f"    -> Found Subject ID:{result[0]} by unique key after conflict.")
                     try: cursor.execute("UPDATE subjects SET external_uri = COALESCE(external_uri, ?) WHERE id = ?", (openalex_id, result[0]))
                     except mariadb.Error: pass
                     return result[0]
                 else:
-                    log.error(f"CRITICAL: Falha ao inserir E falha ao re-buscar Subject '{display_name}' ({openalex_id}). Abortando para este subject.")
+                    log.error(f"CRITICAL: Failed to insert AND failed to re-lookup Subject '{display_name}' ({openalex_id}). Aborting for this subject.")
                     return None
         except mariadb.Error as e_retry:
-            log.error(f"Erro DB ao re-buscar Subject '{display_name}' ({openalex_id}) após conflito: {e_retry}")
+            log.error(f"DB error re-looking up Subject '{display_name}' ({openalex_id}) after conflict: {e_retry}")
             return None
     except mariadb.Error as e_ins:
-        log.error(f"Erro DB inesperado ao inserir Subject '{display_name}' ({openalex_id}): {e_ins}")
+        log.error(f"Unexpected DB error inserting Subject '{display_name}' ({openalex_id}): {e_ins}")
         return None
     except Exception as e_gen:
-        log.error(f"Erro Python inesperado em get_or_create_subject '{display_name}' ({openalex_id}): {e_gen}", exc_info=True)
+        log.error(f"Unexpected Python error in get_or_create_subject '{display_name}' ({openalex_id}): {e_gen}", exc_info=True)
         return None
 
 
@@ -268,14 +229,14 @@ def update_venue_subjects_hierarchical(cursor: mariadb.Cursor, venue_id: int, to
             topic_id = get_or_create_subject_hierarchical(cursor, topic_info, subfield_id, 'OpenAlex', 'Topic')
 
             if topic_id is None and topic_info.get('id') and topic_info.get('display_name'):
-                log.error(f"Falha obter/criar ID tópico: {topic_info.get('display_name')} ({topic_info.get('id')}) para Venue {venue_id}", exc_info=False)
+                log.error(f"Failed to get/create topic ID: {topic_info.get('display_name')} ({topic_info.get('id')}) para Venue {venue_id}", exc_info=False)
                 has_errors = True
                 continue
 
             if topic_id: associated_ids.add(topic_id)
 
         except Exception as e:
-            log.error(f"Erro processar hierarquia tópico {topic_info.get('id', 'N/A')} para Venue {venue_id}: {e}", exc_info=True)
+            log.error(f"Error processing topic hierarchy {topic_info.get('id', 'N/A')} para Venue {venue_id}: {e}", exc_info=True)
             has_errors = True
 
     if not associated_ids:
@@ -287,12 +248,12 @@ def update_venue_subjects_hierarchical(cursor: mariadb.Cursor, venue_id: int, to
         cursor.execute(f"INSERT IGNORE INTO venue_subjects (venue_id, subject_id) VALUES {placeholders}", tuple(params))
         return cursor.rowcount
     except mariadb.Error as e:
-        log.error(f"    -> Erro associar TÓPICOS Venue {venue_id}: {e}")
+        log.error(f"    -> Error associating topics Venue {venue_id}: {e}")
         return 0
 
 
 def collect_json_files(json_dir: str) -> List[str]:
-    log.info(f"Mapeando JSONs em '{json_dir}'...")
+    log.info(f"Mapping JSONs in '{json_dir}'...")
     files: List[str] = []
     with_issn = 0
     without_issn = 0
@@ -315,20 +276,20 @@ def collect_json_files(json_dir: str) -> List[str]:
                     without_issn += 1
                 files.append(filepath)
             except (json.JSONDecodeError, IOError) as e:
-                log.warning(f"Erro processar mapa {filename}: {e}")
+                log.warning(f"Error processing map entry {filename}: {e}")
                 skipped += 1
             except Exception as e:
-                log.error(f"Erro inesperado mapear {filename}: {e}", exc_info=True)
+                log.error(f"Unexpected error mapping {filename}: {e}", exc_info=True)
                 skipped += 1
     except FileNotFoundError:
-        log.error(f"Diretório JSON '{json_dir}' não encontrado.")
+        log.error(f"JSON directory '{json_dir}' not found.")
         return []
     except Exception as e:
-        log.error(f"Erro ao listar diretório '{json_dir}': {e}", exc_info=True)
+        log.error(f"Error listing directory '{json_dir}': {e}", exc_info=True)
         return []
 
     log.info(
-        "Mapeamento concluído. %s arquivos JSON válidos (%s com ISSN, %s sem ISSN). %s pulados.",
+        "Mapping completed. %s valid JSON files (%s with ISSN, %s without ISSN). %s skipped.",
         len(files),
         with_issn,
         without_issn,
@@ -352,7 +313,7 @@ def find_existing_venue(cursor: mariadb.Cursor, data: Dict[str, Any]) -> Optiona
     cols = (
         "id, name, type, issn, eissn, publisher_id, homepage_url, country_code, "
         "open_access, is_in_doaj, aggregation_type, scopus_id, openalex_id, wikidata_id, mag_id, "
-        "is_indexed_in_scopus, cited_by_count, h_index, i10_index, `2yr_mean_citedness`"
+        "is_indexed_in_scopus, cited_by_count, h_index, i10_index, `2yr_mean_citedness`, validation_status"
     )
     sql_base = f"SELECT {cols} FROM venues"
 
@@ -375,7 +336,7 @@ def find_existing_venue(cursor: mariadb.Cursor, data: Dict[str, Any]) -> Optiona
             if found:
                 return found
         except mariadb.Error as e:
-            log.error(f"Erro ao buscar venue por ISSN: {e}")
+            log.error(f"Error looking up venue by ISSN: {e}")
 
     id_lookups: List[Tuple[str, str, Tuple[Any, ...]]] = []
     if openalex_id:
@@ -392,7 +353,7 @@ def find_existing_venue(cursor: mariadb.Cursor, data: Dict[str, Any]) -> Optiona
             if found:
                 return found
         except mariadb.Error as e:
-            log.error(f"Erro ao buscar venue por {key_name}: {e}")
+            log.error(f"Error looking up venue by {key_name}: {e}")
 
     if venue_name:
         try:
@@ -404,7 +365,7 @@ def find_existing_venue(cursor: mariadb.Cursor, data: Dict[str, Any]) -> Optiona
             if found:
                 return found
         except mariadb.Error as e:
-            log.error(f"Erro ao buscar venue por nome/tipo: {e}")
+            log.error(f"Error looking up venue by nome/tipo: {e}")
 
     return None
 
@@ -433,21 +394,6 @@ def recover_venue_id_after_conflict(cursor: mariadb.Cursor, new_venue: Dict[str,
     return None, None
 
 
-def find_conflict_id_by_unique_field(
-    cursor: mariadb.Cursor,
-    field: str,
-    value: Any,
-    current_venue_id: int,
-) -> Optional[int]:
-    if value is None:
-        return None
-    cursor.execute(f"SELECT id FROM venues WHERE {field} = ? LIMIT 1", (value,))
-    result = cursor.fetchone()
-    if result and result[0] != current_venue_id:
-        return result[0]
-    return None
-
-
 def has_name_type_conflict(
     cursor: mariadb.Cursor,
     name: Optional[str],
@@ -464,142 +410,6 @@ def has_name_type_conflict(
     if result and result[0] != current_venue_id:
         return result[0]
     return None
-
-
-def _get_venue_for_merge(cursor: mariadb.Cursor, venue_id: int) -> Optional[Dict[str, Any]]:
-    merge_cols = (
-        "id, name, type, abbreviated_name, publisher_id, country_code, "
-        "issn, eissn, homepage_url, aggregation_type, scopus_id, "
-        "wikidata_id, openalex_id, scielo_id, mag_id, "
-        "open_access, is_in_doaj, is_in_scielo, is_indexed_in_scopus"
-    )
-    cursor.execute(f"SELECT {merge_cols} FROM venues WHERE id = ? FOR UPDATE", (venue_id,))
-    return row_to_dict(cursor, cursor.fetchone())
-
-
-def merge_venues_python_fallback(
-    cursor: mariadb.Cursor,
-    primary_venue_id: int,
-    secondary_venue_id: int,
-    conflict_field: str,
-) -> bool:
-    if primary_venue_id == secondary_venue_id:
-        return False
-
-    primary = _get_venue_for_merge(cursor, primary_venue_id)
-    if not primary:
-        raise mariadb.OperationalError(f"Venue primário {primary_venue_id} não encontrado para merge.")
-
-    secondary = _get_venue_for_merge(cursor, secondary_venue_id)
-    if not secondary:
-        log.info(
-            "  -> Merge fallback (field=%s): venue secundário %s já não existe; tratando como unificado.",
-            conflict_field,
-            secondary_venue_id,
-        )
-        return True
-
-    cursor.execute(
-        "UPDATE publications SET venue_id = ? WHERE venue_id = ?",
-        (primary_venue_id, secondary_venue_id),
-    )
-    moved_pubs = cursor.rowcount
-
-    cursor.execute(
-        """
-        INSERT IGNORE INTO venue_subjects (venue_id, subject_id, score, source)
-        SELECT ?, subject_id, score, source
-        FROM venue_subjects
-        WHERE venue_id = ?
-        """,
-        (primary_venue_id, secondary_venue_id),
-    )
-    merged_subjects = cursor.rowcount
-
-    cursor.execute(
-        """
-        UPDATE venue_yearly_stats p
-        JOIN venue_yearly_stats s
-          ON s.year = p.year
-         AND s.venue_id = ?
-        SET
-            p.works_count = COALESCE(p.works_count, 0) + COALESCE(s.works_count, 0),
-            p.oa_works_count = COALESCE(p.oa_works_count, 0) + COALESCE(s.oa_works_count, 0),
-            p.cited_by_count = COALESCE(p.cited_by_count, 0) + COALESCE(s.cited_by_count, 0)
-        WHERE p.venue_id = ?
-        """,
-        (secondary_venue_id, primary_venue_id),
-    )
-
-    cursor.execute(
-        """
-        INSERT INTO venue_yearly_stats (venue_id, year, works_count, oa_works_count, cited_by_count)
-        SELECT ?, s.year, s.works_count, s.oa_works_count, s.cited_by_count
-        FROM venue_yearly_stats s
-        LEFT JOIN venue_yearly_stats p
-               ON p.venue_id = ?
-              AND p.year = s.year
-        WHERE s.venue_id = ?
-          AND p.venue_id IS NULL
-        """,
-        (primary_venue_id, primary_venue_id, secondary_venue_id),
-    )
-
-    cursor.execute("DELETE FROM venues WHERE id = ?", (secondary_venue_id,))
-    if cursor.rowcount == 0:
-        log.warning(
-            "  -> Merge fallback (field=%s): venue secundário %s já foi removido antes do DELETE.",
-            conflict_field,
-            secondary_venue_id,
-        )
-
-    update_fields: Dict[str, Any] = {}
-    for field in VENUE_MERGE_FILL_IF_NULL_FIELDS:
-        primary_val = primary.get(field)
-        secondary_val = secondary.get(field)
-        if primary_val is not None or secondary_val is None:
-            continue
-
-        if field in VENUE_MERGE_UNIQUE_FIELDS:
-            cursor.execute(f"SELECT id FROM venues WHERE {field} = ? AND id <> ? LIMIT 1", (secondary_val, primary_venue_id))
-            conflict = cursor.fetchone()
-            if conflict:
-                log.warning(
-                    "  -> Merge fallback (field=%s): valor '%s' de %s não transferido para venue %s (já usado por venue %s).",
-                    conflict_field,
-                    secondary_val,
-                    field,
-                    primary_venue_id,
-                    conflict[0],
-                )
-                continue
-
-        update_fields[field] = secondary_val
-
-    for field in VENUE_MERGE_BOOL_MAX_FIELDS:
-        primary_v = int(bool(primary.get(field)))
-        secondary_v = int(bool(secondary.get(field)))
-        merged_v = max(primary_v, secondary_v)
-        if primary.get(field) is None or merged_v != primary_v:
-            update_fields[field] = merged_v
-
-    if update_fields:
-        clauses = ", ".join([f"`{k}` = ?" for k in update_fields])
-        params = list(update_fields.values()) + [primary_venue_id]
-        cursor.execute(
-            f"UPDATE venues SET {clauses}, `updated_at` = NOW() WHERE id = ?",
-            tuple(params),
-        )
-
-    log.warning(
-        "  -> Duplicata unificada via fallback Python por %s: primary=%s <- secondary=%s (pubs:%s, subjects:%s).",
-        conflict_field,
-        primary_venue_id,
-        secondary_venue_id,
-        moved_pubs,
-        merged_subjects,
-    )
-    return True
 
 
 def filter_conflicting_updates(
@@ -660,7 +470,7 @@ def filter_conflicting_updates(
                 return True
             except mariadb.Error as e_merge:
                 log.error(
-                    "  -> Falha ao unificar duplicata via procedure (primary=%s, secondary=%s, field=%s): %s",
+                    "  -> Failed to merge duplicate via procedure (primary=%s, secondary=%s, field=%s): %s",
                     venue_id,
                     conflict_id,
                     conflict_field,
@@ -674,7 +484,7 @@ def filter_conflicting_updates(
             return True
         except mariadb.Error as e_merge_fallback:
             log.error(
-                "  -> Falha ao unificar duplicata via fallback Python (primary=%s, secondary=%s, field=%s): %s",
+                "  -> Failed to merge duplicate via Python fallback (primary=%s, secondary=%s, field=%s): %s",
                 venue_id,
                 conflict_id,
                 conflict_field,
@@ -694,7 +504,7 @@ def filter_conflicting_updates(
                 if merge_ok:
                     continue
                 log.warning(
-                    "  -> Ignorando %s em %s para venue %s: valor já pertence ao venue %s.",
+                    "  -> Ignoring %s em %s para venue %s: value already belongs to venue %s.",
                     field,
                     target_name,
                     venue_id,
@@ -713,7 +523,7 @@ def filter_conflicting_updates(
                     upd_ovr.pop('name', None)
                     upd_ovr.pop('type', None)
                     log.warning(
-                        "  -> Ignorando name/type em OvW para venue %s: combinação name+type ainda conflita com venue %s após merge.",
+                        "  -> Ignoring name/type em OvW para venue %s: name+type combination still conflicts with venue %s after merge.",
                         venue_id,
                         still_conflict,
                     )
@@ -721,7 +531,7 @@ def filter_conflicting_updates(
                 upd_ovr.pop('name', None)
                 upd_ovr.pop('type', None)
                 log.warning(
-                    "  -> Ignorando name/type em OvW para venue %s: combinação name+type já pertence ao venue %s.",
+                    "  -> Ignoring name/type em OvW para venue %s: name+type combination already belongs to venue %s.",
                     venue_id,
                     conflict_id,
                 )
@@ -751,13 +561,13 @@ def create_new_venue(
             val = str(new).strip()
             return val if val else None
         except (ValueError, TypeError, AttributeError):
-            log.warning(f"Valor inválido '{new}' para campo {field} durante criação.")
+            log.warning(f"Invalid value '{new}' for field {field} during creation.")
             return None
 
     
     new_venue['name'] = prep_val(data.get('display_name'), 'name')
     if not new_venue['name']:
-        log.warning(f"  -> JSON sem 'display_name' ({data.get('id', 'N/A')}). Pulando criação.")
+        log.warning(f"  -> JSON missing 'display_name' ({data.get('id', 'N/A')}). Skipping creation.")
         return None, False
     
     new_venue['homepage_url'] = prep_val(data.get('homepage_url'), 'homepage_url')
@@ -789,22 +599,25 @@ def create_new_venue(
         try: 
             pid = get_or_create_publisher(cur_p, pname)
         except Exception as e:
-            log.error(f"Erro ao obter/criar publisher '{pname}': {e}")
+            log.error(f"Error getting/creating publisher '{pname}': {e}")
         finally: 
             cur_p.close()
     new_venue['publisher_id'] = pid
     
     new_venue['type'] = normalize_venue_type(data.get('type'))
-    
+    new_venue['validation_status'] = 'VALIDATED'
+
     cols = []; vals = []; params = []
     for k, v in new_venue.items():
         if v is not None:
             cols.append(f"`{k}`")
             vals.append("?")
             params.append(v)
-            
-    if not cols: 
-        log.warning(f"  -> Nenhum dado válido para criar venue de ({data.get('id', 'N/A')}).")
+
+    cols.append("last_validated_at"); vals.append("CURRENT_TIMESTAMP")
+
+    if not cols:
+        log.warning(f"  -> No valid data to create venue de ({data.get('id', 'N/A')}).")
         return None, False
 
     query = f"INSERT INTO venues ({','.join(cols)}) VALUES ({','.join(vals)})"
@@ -813,7 +626,7 @@ def create_new_venue(
         existing_id, existing_key = recover_venue_id_after_conflict(cursor, new_venue)
         if existing_id:
             log.info(
-                "  -> Venue já existente antes do INSERT (chave '%s'): ID %s",
+                "  -> Venue already exists before INSERT (key '%s'): ID %s",
                 existing_key,
                 existing_id,
             )
@@ -825,32 +638,32 @@ def create_new_venue(
             return new_id, True
         except mariadb.IntegrityError as e_int:
             log.warning(
-                "Conflito ao CRIAR venue '%s' (OA:%s). %s. Recuperando...",
+                "Conflict creating venue '%s' (OA:%s). %s. Recovering...",
                 new_venue.get('name'),
                 new_venue.get('openalex_id'),
                 e_int,
             )
             try:
-                venue_id_recuperado, chave = recover_venue_id_after_conflict(cursor, new_venue)
-                if venue_id_recuperado:
-                    log.info(f"  -> Venue recuperado após conflito pela chave '{chave}': ID {venue_id_recuperado}")
-                    return venue_id_recuperado, False
-                log.error(f"FALHA CRÍTICA ao recuperar venue '{new_venue['name']}' após IntegrityError.")
+                venue_id_recovered, key = recover_venue_id_after_conflict(cursor, new_venue)
+                if venue_id_recovered:
+                    log.info(f"  -> Venue recovered after conflict by key '{key}': ID {venue_id_recovered}")
+                    return venue_id_recovered, False
+                log.error(f"CRITICAL FAILURE recovering venue '{new_venue['name']}' after IntegrityError.")
                 return None, False
             except mariadb.Error as e_retry:
-                log.error(f"Erro DB ao recuperar venue '{new_venue['name']}' pós-conflito: {e_retry}")
+                log.error(f"DB error recovering venue '{new_venue['name']}' post-conflict: {e_retry}")
                 return None, False
         except mariadb.Error as e_ins:
-             log.error(f"Erro DB ao CRIAR venue '{new_venue['name']}': {e_ins}")
+             log.error(f"DB error creating venue '{new_venue['name']}': {e_ins}")
              return None, False
     else:
         log.info(f"[DRY-RUN] -> Criaria Venue ({new_venue['name']}): Q:{query}|P:{tuple(params)}")
         return -1, True
 
 
-def unificar_duplicatas_internas(conn: mariadb.Connection):
+def merge_internal_duplicates(conn: mariadb.Connection):
                                                                               
-    log.info("--- Iniciando unificação interna (ISSN) ---"); cursor = None
+    log.info("--- Starting internal dedup (ISSN) ---"); cursor = None
     try:
         cursor = conn.cursor(); issn_map = {}
         cursor.execute("SELECT id, issn, eissn FROM venues WHERE issn IS NOT NULL OR eissn IS NOT NULL")
@@ -865,9 +678,9 @@ def unificar_duplicatas_internas(conn: mariadb.Connection):
                 pid = uids[0]
                 for sid in uids[1:]:
                     if sid not in to_remove: log.warning(f"  -> Duplicata interna: ISSN '{issn}'. P:{pid} <- S:{sid}"); merge_pairs.append((pid, sid)); to_remove.add(sid)
-        if not merge_pairs: log.info("Nenhuma duplicata interna (ISSN) encontrada."); return
+        if not merge_pairs: log.info("No internal duplicates (ISSN) found."); return
 
-        log.info(f"Encontradas {len(merge_pairs)} unificações internas."); merged_count = 0
+        log.info(f"Found {len(merge_pairs)} internal merges."); merged_count = 0
         for pid, sid in merge_pairs:
             try:
                 cursor.execute("UPDATE publications SET venue_id = ? WHERE venue_id = ?", (pid, sid)); pubs_moved = cursor.rowcount
@@ -878,38 +691,38 @@ def unificar_duplicatas_internas(conn: mariadb.Connection):
                     conn.commit()
                     merged_count += 1
                 else:
-                    log.warning(f"    -> Venue secundário {sid} não encontrado para remoção (já removido?).")
+                    log.warning(f"    -> Secondary venue {sid} not found for removal (already removed?).")
                     conn.rollback()
-            except mariadb.Error as e: log.error(f"    -> Erro DB unificar {sid} -> {pid}: {e}"); conn.rollback()
-        log.info(f"Unificações internas realizadas: {merged_count} de {len(merge_pairs)}.")
-    except mariadb.Error as e: log.error(f"Erro geral unificação interna: {e}"); conn.rollback()
+            except mariadb.Error as e: log.error(f"    -> DB error merging {sid} -> {pid}: {e}"); conn.rollback()
+        log.info(f"Internal merges completed: {merged_count} de {len(merge_pairs)}.")
+    except mariadb.Error as e: log.error(f"Internal dedup error: {e}"); conn.rollback()
     finally:
         if cursor: cursor.close()
-        log.info("--- Unificação interna concluída ---")
+        log.info("--- Internal dedup completed ---")
 
-def unificar_venues_via_mapa(conn: mariadb.Connection, json_dir: str, arquivo_mapa="venue_merge_map.csv"):
+def merge_venues_via_map(conn: mariadb.Connection, json_dir: str, map_file="venue_merge_map.csv"):
                                                                                 
-    map_path = os.path.join(get_repo_root(), arquivo_mapa)
-    if not os.path.exists(map_path): log.info(f"Mapa '{map_path}' não encontrado. Pulando."); return
+    map_path = os.path.join(get_repo_root(), map_file)
+    if not os.path.exists(map_path): log.info(f"Mapa '{map_path}' not found. Skipping."); return
 
-    log.info(f"--- Iniciando unificação via mapa '{map_path}' ---"); processed, unified = 0, 0; cursor = None
+    log.info(f"--- Starting merge via map '{map_path}' ---"); processed, unified = 0, 0; cursor = None
     try:
         with open(map_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row_num, row in enumerate(reader, start=1):
                 processed += 1; id_inc_str, issn_corr = row.get('id_venue_incorreto'), row.get('issn_correto')
-                if not id_inc_str or not issn_corr: log.warning(f"Linha {row_num} inválida. Pulando."); continue
+                if not id_inc_str or not issn_corr: log.warning(f"Line {row_num} invalid. Skipping."); continue
                 try: sid = int(id_inc_str)
-                except ValueError: log.error(f"ID inválido '{id_inc_str}' linha {row_num}. Pulando."); continue
+                except ValueError: log.error(f"ID invalid '{id_inc_str}' linha {row_num}. Skipping."); continue
 
                 if cursor is None: cursor = conn.cursor()
                 try:
                     cursor.execute("SELECT 1 FROM venues WHERE id = ?", (sid,));
-                    if not cursor.fetchone(): log.info(f"Mapa (L{row_num}): ID {sid} não existe. Pulando."); continue
+                    if not cursor.fetchone(): log.info(f"Mapa (L{row_num}): ID {sid} does not exist. Skipping."); continue
 
                     cursor.execute("SELECT id FROM venues WHERE issn = ? OR eissn = ?", (issn_corr, issn_corr)); vp = cursor.fetchone(); pid = None
                     if not vp:
-                        log.warning(f"Mapa (L{row_num}): Primário ISSN '{issn_corr}' não no DB. Tentando criar.");
+                        log.warning(f"Mapa (L{row_num}): Primary ISSN '{issn_corr}' not in DB. Attempting to create.");
                         issn_corr_nohyphen = issn_corr.replace('-', '')
                         json_filenames_to_try = [f"{issn_corr}.json", f"{issn_corr_nohyphen}.json"]
                         jpath = None
@@ -919,18 +732,18 @@ def unificar_venues_via_mapa(conn: mariadb.Connection, json_dir: str, arquivo_ma
                                 jpath = potential_path
                                 break
 
-                        if not jpath: log.error(f"  -> JSON para ISSN '{issn_corr}' ou '{issn_corr_nohyphen}' não encontrado. Pulando."); continue
+                        if not jpath: log.error(f"  -> JSON para ISSN '{issn_corr}' ou '{issn_corr_nohyphen}' not found. Skipping."); continue
 
                         try:
                             with open(jpath, 'r', encoding='utf-8') as jf: data = json.load(jf)
-                        except Exception as e: log.error(f"  -> Erro ler JSON '{jpath}': {e}. Pulando."); continue
+                        except Exception as e: log.error(f"  -> Error reading JSON '{jpath}': {e}. Skipping."); continue
 
                         nname = data.get('display_name');
-                        if not nname: log.error(f"  -> 'display_name' não em '{jpath}'. Pulando."); continue
+                        if not nname: log.error(f"  -> 'display_name' not in '{jpath}'. Skipping."); continue
 
                         cursor.execute("SELECT id FROM venues WHERE name = ? AND (type = 'JOURNAL' OR type IS NULL)", (nname,)); ex_by_name = cursor.fetchone()
                         if ex_by_name:
-                            pid = ex_by_name[0]; log.warning(f"  -> Venue nome '{nname}' já existe (ID:{pid}). Usando como primário.");
+                            pid = ex_by_name[0]; log.warning(f"  -> Venue name '{nname}' already exists (ID:{pid}). Using as primary.");
                             ni_l, ni_list = data.get('issn_l'), (data.get('issn') or [])
                             ni_e = next((i for i in ni_list if i and i != ni_l), None)
                             cursor.execute("UPDATE venues SET issn = COALESCE(issn, ?), eissn = COALESCE(eissn, ?) WHERE id = ?", (ni_l, ni_e, pid))
@@ -942,13 +755,13 @@ def unificar_venues_via_mapa(conn: mariadb.Connection, json_dir: str, arquivo_ma
                                 cur_p=conn.cursor();
                                 try: p_id=get_or_create_publisher(cur_p, p_name)
                                 finally: cur_p.close()
-                            log.info(f"  -> Criando venue primário: '{nname}' ISSN {issn_corr}")
+                            log.info(f"  -> Creating primary venue: '{nname}' ISSN {issn_corr}")
                             cursor.execute("INSERT INTO venues (name, type, issn, eissn, publisher_id) VALUES (?, 'JOURNAL', ?, ?, ?)", (nname, ni_l if ni_l else issn_corr, ni_e, p_id));
                             pid=cursor.lastrowid; log.info(f"  -> Novo venue ID {pid}.")
                     else: pid = vp[0]
 
-                    if not pid: log.error(f"Mapa (L{row_num}): Falha determinar ID primário '{issn_corr}'. Pulando."); continue
-                    if pid == sid: log.info(f"Mapa (L{row_num}): IDs iguais ({pid}). Pulando."); continue
+                    if not pid: log.error(f"Mapa (L{row_num}): Failed to determine primary ID '{issn_corr}'. Skipping."); continue
+                    if pid == sid: log.info(f"Mapa (L{row_num}): IDs iguais ({pid}). Skipping."); continue
 
                     log.warning(f"Unificando ID {sid} -> ID {pid} (ISSN:{issn_corr}, L{row_num}).")
                     cursor.execute("UPDATE publications SET venue_id = ? WHERE venue_id = ?", (pid, sid)); pubs_moved = cursor.rowcount
@@ -958,15 +771,15 @@ def unificar_venues_via_mapa(conn: mariadb.Connection, json_dir: str, arquivo_ma
                          log.info(f"  -> Unificado. Pubs:{pubs_moved}, Subs:{subs_merged}. Venue {sid} removido.")
                          conn.commit(); unified += 1
                     else:
-                        log.warning(f"  -> Venue secundário {sid} não encontrado para remoção.")
+                        log.warning(f"  -> Secondary venue {sid} not found for removal.")
                         conn.rollback()
-                except mariadb.Error as e: log.error(f"Erro DB (L{row_num}): {e}"); conn.rollback()
-                except Exception as e: log.error(f"Erro Inesperado (L{row_num}): {e}", exc_info=True); conn.rollback()
-    except FileNotFoundError: log.error(f"Mapa '{map_path}' não encontrado.")
-    except Exception as e: log.error(f"Erro ler mapa '{map_path}': {e}", exc_info=True)
+                except mariadb.Error as e: log.error(f"DB error (L{row_num}): {e}"); conn.rollback()
+                except Exception as e: log.error(f"Unexpected error (L{row_num}): {e}", exc_info=True); conn.rollback()
+    except FileNotFoundError: log.error(f"Mapa '{map_path}' not found.")
+    except Exception as e: log.error(f"Error reading map '{map_path}': {e}", exc_info=True)
     finally:
         if cursor: cursor.close()
-    log.info(f"--- Unificação via mapa concluída. {processed} linhas, {unified} unificações. ---")
+    log.info(f"--- Merge via map completed. {processed} lines, {unified} merges. ---")
 
 
 def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argparse.Namespace):
@@ -1029,10 +842,10 @@ def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argpars
                             if new is not None or field in ['name','homepage_url','country_code','issn','eissn','openalex_id','wikidata_id','mag_id','publisher_id', 'cited_by_count', 'h_index', 'i10_index', '2yr_mean_citedness']:
                                 target[field] = new
                         except (ValueError, TypeError) as e:
-                            log.warning(f"  -> Erro conversão '{orig}' campo {field} (ID {venue_id}): {e}.")
+                            log.warning(f"  -> Conversion error '{orig}' campo {field} (ID {venue_id}): {e}.")
 
                 check_add(data.get('display_name'), venue.get('name'), 'name', 'fill_if_null')
-                # Quando aggregation_type já existe no DB (ex.: Scopus), ele tem precedência para evitar ping-pong de type.
+                # When aggregation_type already exists in DB (e.g. from Scopus), it takes precedence to avoid type ping-pong.
                 existing_agg_type = venue.get('aggregation_type')
                 if existing_agg_type:
                     canonical_type = normalize_venue_type(existing_agg_type)
@@ -1087,18 +900,23 @@ def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argpars
                     )
                     if merged_any and not args.dry_run:
                         updated_this_venue = True
-                    clauses, params = [], []
-                    if upd_ovr: clauses.extend([f"`{k}`=?" for k in upd_ovr]); params.extend(upd_ovr.values())
-                    if upd_fil: clauses.extend([f"`{k}`=COALESCE(`{k}`,?)" for k in upd_fil]); params.extend(upd_fil.values())
-                    if clauses:
-                        params.append(venue['id']); query = f"UPDATE venues SET {','.join(clauses)} WHERE id=?"
 
-                        if not args.dry_run:
-                            cursor_update.execute(query, tuple(params))
-                            if cursor_update.rowcount > 0:
-                                updated_this_venue = True
-                        else:
+                clauses, params = [], []
+                if upd_ovr: clauses.extend([f"`{k}`=?" for k in upd_ovr]); params.extend(upd_ovr.values())
+                if upd_fil: clauses.extend([f"`{k}`=COALESCE(`{k}`,?)" for k in upd_fil]); params.extend(upd_fil.values())
+                # Mark as validated when we have OpenAlex data
+                if venue.get('validation_status') in ('PENDING', None):
+                    clauses.append("validation_status = 'VALIDATED'")
+                    clauses.append("last_validated_at = CURRENT_TIMESTAMP")
+                if clauses:
+                    params.append(venue['id']); query = f"UPDATE venues SET {','.join(clauses)} WHERE id=?"
+
+                    if not args.dry_run:
+                        cursor_update.execute(query, tuple(params))
+                        if cursor_update.rowcount > 0:
                             updated_this_venue = True
+                    else:
+                        updated_this_venue = True
 
                 linked = 0
                 if not args.dry_run:
@@ -1172,13 +990,13 @@ def enrich_venues(conn: mariadb.Connection, json_files: List[str], args: argpars
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Unifica, verifica e enriquece venues.")
-    parser.add_argument('--json-dir', required=True, help="Diretório com JSONs OpenAlex.")
-    parser.add_argument('--batch-size', type=int, default=100, help="Venues por lote. (Não usado na nova lógica JSON-first, mas mantido por args)")
-    parser.add_argument('--limit', type=int, default=None, help="Limite total de arquivos JSON.")
-    parser.add_argument('--dry-run', action='store_true', help="Não salva alterações.")
-    parser.add_argument('--no-merge-duplicates', action='store_true', help="Desativa unificação automática de duplicatas quando houver conflito de chave única.")
-    parser.add_argument('--prefer-db-merge-procedure', action='store_true', help="Tenta usar sp_merge_single_venue_pair antes do fallback Python para unificação de duplicatas.")
+    parser = argparse.ArgumentParser(description="Load OpenAlex venue metadata into the database.")
+    parser.add_argument('--json-dir', required=True, help="Directory with OpenAlex JSON files.")
+    parser.add_argument('--batch-size', type=int, default=100, help="Venues per batch (kept for compat).")
+    parser.add_argument('--limit', type=int, default=None, help="Max JSON files to process.")
+    parser.add_argument('--dry-run', action='store_true', help="Simulate without writing to DB.")
+    parser.add_argument('--no-merge-duplicates', action='store_true', help="Disable auto-merge on unique constraint conflict.")
+    parser.add_argument('--prefer-db-merge-procedure', action='store_true', help="Try sp_merge_single_venue_pair before Python fallback.")
     args = parser.parse_args()
 
     conn = None
@@ -1186,35 +1004,35 @@ def main():
         conn = get_connection()
 
         if not args.dry_run:
-            unificar_duplicatas_internas(conn)
-            unificar_venues_via_mapa(conn, args.json_dir)
-        else: log.warning("DRY-RUN: Unificação pulada.")
+            merge_internal_duplicates(conn)
+            merge_venues_via_map(conn, args.json_dir)
+        else: log.warning("DRY-RUN: Merge skipped.")
 
         json_files = collect_json_files(args.json_dir)
         if not json_files:
-            log.error("Nenhum JSON mapeado. Verifique diretório.")
+            log.error("No JSON files mapped. Check directory.")
             return
 
         enrich_venues(conn, json_files, args)
 
     except Exception as e:
-        log.critical(f"Falha Crítica no processo principal: {e}", exc_info=True)
+        log.critical(f"Critical failure in main process: {e}", exc_info=True)
         if conn:
             try:
                 conn.rollback()
                 log.info("Rollback final realizado devido a erro.")
             except mariadb.Error as rb_err:
-                log.error(f"Erro no rollback final: {rb_err}")
+                log.error(f"Error in final rollback: {rb_err}")
     finally:
         if conn:
             try:
                  conn.autocommit = True
                  conn.close()
-                 log.info("Processo finalizado. Conexão fechada.")
+                 log.info("Process finished. Connection closed.")
             except mariadb.Error as close_err:
-                 log.error(f"Erro ao fechar conexão: {close_err}")
+                 log.error(f"Error closing connection: {close_err}")
         else:
-             log.info("Processo finalizado (conexão não estabelecida ou já fechada).")
+             log.info("Process finished (connection not established or already closed).")
 
 if __name__ == '__main__':
     main()

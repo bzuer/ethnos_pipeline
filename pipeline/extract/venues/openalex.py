@@ -10,13 +10,14 @@ import argparse
 import sys
 import os
 import json
-import time
 import logging
 import httpx
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-from pipeline.extract.common import read_config, load_venues_from_csv, normalize_issn
+from pipeline.extract.config import read_config, set_config
+from pipeline.extract.retry import retry_request
+from pipeline.extract.http import create_client
+from pipeline.extract.venues_common import load_venues_from_csv, load_pending_venues_from_db, normalize_issn, process_venues_batched
+from pipeline.extract.io_utils import write_not_found_marker, has_not_found_marker, remove_not_found_marker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,29 +32,20 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 BASE_API_URL = "https://api.openalex.org/sources"
 DEFAULT_OUTPUT_DIR = "venues/openalex"
-MAX_RETRIES = 3
 
 
 def _request_get(client, url, params, label):
     """Execute an OpenAlex request with retry/backoff. Returns response JSON or None."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = client.get(url, params=params)
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 404:
-                return None
-            if resp.status_code == 429:
-                wait = 2 ** attempt
-                logging.warning(f"  429 rate-limit on {label}, retry in {wait}s ({attempt}/{MAX_RETRIES})")
-                time.sleep(wait)
-                continue
-            logging.warning(f"  HTTP {resp.status_code} on {label} ({attempt}/{MAX_RETRIES})")
-        except httpx.HTTPError as e:
-            logging.warning(f"  Request error on {label}: {e} ({attempt}/{MAX_RETRIES})")
-            if attempt < MAX_RETRIES:
-                time.sleep(2 ** attempt)
-    return None
+    def _attempt():
+        resp = client.get(url, params=params)
+        if resp.status_code == 200:
+            return 'success', resp.json()
+        if resp.status_code == 404:
+            return 'not_found', None
+        if resp.status_code == 429:
+            return 'retry_429', None
+        return 'retry', None
+    return retry_request(_attempt, label=label)
 
 
 def process_venue(client, venue, output_dir, force, index, total):
@@ -71,6 +63,9 @@ def process_venue(client, venue, output_dir, force, index, total):
             if candidate and os.path.exists(os.path.join(output_dir, f"{candidate}.json")):
                 logging.info(f"{prefix} → Cached")
                 return 'skipped'
+        if has_not_found_marker(output_dir, venue_id):
+            logging.info(f"{prefix} → Skipped (previously not found)")
+            return 'not_found'
 
     data = None
     cache_key = None
@@ -98,6 +93,7 @@ def process_venue(client, venue, output_dir, force, index, total):
 
     if not data or not cache_key:
         logging.info(f"{prefix} → Not found")
+        write_not_found_marker(output_dir, venue_id)
         return 'not_found'
 
     output_file = os.path.join(output_dir, f"{cache_key}.json")
@@ -106,6 +102,8 @@ def process_venue(client, venue, output_dir, force, index, total):
     if not force and os.path.exists(output_file):
         logging.info(f"{prefix} → Cached")
         return 'skipped'
+
+    remove_not_found_marker(output_dir, venue_id)
 
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -129,11 +127,8 @@ def main():
                         help="Max venues to process (0 = unlimited).")
     args = parser.parse_args()
 
-    if not os.path.isfile(args.input_file):
-        logging.error(f"Input file does not exist: {args.input_file}")
-        sys.exit(1)
-
     config = read_config(args.config)
+    set_config(config)
     email = config.get('openalex', 'email',
                        fallback=config.get('api', 'email', fallback='anonymous@example.com'))
     workers = config.getint('openalex', 'workers', fallback=2)
@@ -142,49 +137,26 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    venues = load_venues_from_csv(args.input_file)
+    if args.force:
+        if not os.path.isfile(args.input_file):
+            logging.error(f"Input file does not exist: {args.input_file}")
+            sys.exit(1)
+        venues = load_venues_from_csv(args.input_file)
+    else:
+        venues = load_pending_venues_from_db(config_path=args.config)
     if args.limit > 0:
         venues = venues[:args.limit]
 
-    total = len(venues)
-    total_batches = (total + batch_size - 1) // batch_size
+    logging.info(f"--- OpenAlex venue collect: {len(venues)} venues, {workers} workers → {args.output_dir} ---")
 
-    logging.info(f"--- OpenAlex venue collect: {total} venues, {total_batches} batches, {workers} workers → {args.output_dir} ---")
+    with create_client(config, workers=workers) as client:
+        def _process(venue, index, total_count):
+            return process_venue(client, venue, args.output_dir, args.force, index, total_count)
 
-    limits = httpx.Limits(max_keepalive_connections=workers + 5, max_connections=workers + 10)
-    headers = {"User-Agent": f"VenueCollector/1.0 (mailto:{email})"}
-
-    totals = {'success': 0, 'skipped': 0, 'not_found': 0, 'failed': 0}
-
-    with httpx.Client(timeout=30.0, headers=headers, limits=limits, follow_redirects=True) as client:
-        for i in range(0, total, batch_size):
-            batch = venues[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
-            batch_stats = {'success': 0, 'skipped': 0, 'not_found': 0, 'failed': 0}
-
-            logging.info(f"--- Batch {batch_num}/{total_batches} ({len(batch)} venues) ---")
-
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = {
-                    executor.submit(process_venue, client, venue, args.output_dir,
-                                    args.force, i + j + 1, total): venue
-                    for j, venue in enumerate(batch)
-                }
-                for future in as_completed(futures):
-                    venue = futures[future]
-                    try:
-                        status = future.result()
-                        batch_stats[status] = batch_stats.get(status, 0) + 1
-                    except Exception as e:
-                        logging.error(f"{venue.get('venue_id')} → Error: {e}")
-                        batch_stats['failed'] += 1
-
-            for k in totals:
-                totals[k] += batch_stats[k]
-
-            logging.info(f"--- Batch {batch_num} done: {batch_stats} | Total so far: {totals} ---")
-            if batch_num < total_batches:
-                time.sleep(pause)
+        totals = process_venues_batched(
+            venues, process_fn=_process,
+            workers=workers, batch_size=batch_size, pause=pause,
+        )
 
     logging.info(f"=== Finished: {totals} ===")
 

@@ -10,13 +10,13 @@ import argparse
 import sys
 import os
 import json
-import time
 import logging
-import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', '..'))
-from pipeline.extract.common import read_config, load_venues_from_csv, normalize_issn
+from pipeline.extract.config import read_config, set_config
+from pipeline.extract.retry import retry_request
+from pipeline.extract.http import create_client
+from pipeline.extract.venues_common import load_venues_from_csv, load_pending_venues_from_db, normalize_issn, process_venues_batched
+from pipeline.extract.io_utils import write_not_found_marker, has_not_found_marker, remove_not_found_marker
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,7 +29,6 @@ logging.basicConfig(
 
 BASE_API_URL = "https://api.elsevier.com/content/serial/title"
 DEFAULT_OUTPUT_DIR = "venues/scopus"
-MAX_RETRIES = 3
 
 
 def build_headers(config):
@@ -49,29 +48,35 @@ def build_headers(config):
     return headers
 
 
-def _request(session, params, label):
+def _has_valid_entries(data):
+    """Check if Scopus API response contains actual serial entries."""
+    smr = data.get("serial-metadata-response") if isinstance(data, dict) else None
+    if not isinstance(smr, dict):
+        return False
+    if smr.get("error"):
+        return False
+    entries = smr.get("entry")
+    return isinstance(entries, list) and len(entries) > 0
+
+
+def _request(client, params, label):
     """Execute a Scopus API request with retry/backoff. Returns JSON dict or None."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = session.get(BASE_API_URL, params=params, timeout=30)
-            if resp.status_code == 200:
-                return resp.json()
-            if resp.status_code == 404:
-                return None
-            if resp.status_code == 429:
-                wait = 2 ** attempt
-                logging.warning(f"  429 rate-limit on {label}, retry in {wait}s ({attempt}/{MAX_RETRIES})")
-                time.sleep(wait)
-                continue
-            logging.warning(f"  HTTP {resp.status_code} on {label} ({attempt}/{MAX_RETRIES})")
-        except requests.exceptions.RequestException as e:
-            logging.warning(f"  Request error on {label}: {e} ({attempt}/{MAX_RETRIES})")
-            if attempt < MAX_RETRIES:
-                time.sleep(2 ** attempt)
-    return None
+    def _attempt():
+        resp = client.get(BASE_API_URL, params=params, timeout=30)
+        if resp.status_code == 200:
+            data = resp.json()
+            if _has_valid_entries(data):
+                return 'success', data
+            return 'not_found', None
+        if resp.status_code == 404:
+            return 'not_found', None
+        if resp.status_code == 429:
+            return 'retry_429', None
+        return 'retry', None
+    return retry_request(_attempt, label=label)
 
 
-def process_venue(session, venue, output_dir, force, index, total):
+def process_venue(client, venue, output_dir, force, index, total):
     """Fetch metadata for a single venue via ISSN -> eISSN -> name cascade."""
     venue_id = venue['venue_id']
     name = venue.get('venue_name', '').strip()
@@ -83,6 +88,10 @@ def process_venue(session, venue, output_dir, force, index, total):
         logging.info(f"{prefix} → Cached")
         return 'skipped'
 
+    if not force and has_not_found_marker(output_dir, venue_id):
+        logging.info(f"{prefix} → Skipped (previously not found)")
+        return 'not_found'
+
     issn = normalize_issn(venue.get('issn', ''))
     eissn = normalize_issn(venue.get('eissn', ''))
 
@@ -91,21 +100,24 @@ def process_venue(session, venue, output_dir, force, index, total):
 
     # Cascade: ISSN -> eISSN -> name
     if issn:
-        data = _request(session, {"issn": issn}, f"issn={issn}")
+        data = _request(client, {"issn": issn}, f"issn={issn}")
         if data:
             matched_by = f"issn={issn}"
     if not data and eissn:
-        data = _request(session, {"issn": eissn}, f"eissn={eissn}")
+        data = _request(client, {"issn": eissn}, f"eissn={eissn}")
         if data:
             matched_by = f"eissn={eissn}"
     if not data and name:
-        data = _request(session, {"title": name}, f"title={name}")
+        data = _request(client, {"title": name}, f"title={name}")
         if data:
             matched_by = f"title"
 
     if not data:
         logging.info(f"{prefix} → Not found")
+        write_not_found_marker(output_dir, venue_id)
         return 'not_found'
+
+    remove_not_found_marker(output_dir, venue_id)
 
     with open(output_file, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
@@ -129,12 +141,9 @@ def main():
                         help="Max venues to process (0 = unlimited).")
     args = parser.parse_args()
 
-    if not os.path.isfile(args.input_file):
-        logging.error(f"Input file does not exist: {args.input_file}")
-        sys.exit(1)
-
     config = read_config(args.config)
-    headers = build_headers(config)
+    set_config(config)
+    scopus_headers = build_headers(config)
 
     workers = config.getint('scopus', 'workers', fallback=2)
     batch_size = config.getint('scopus', 'batch_size', fallback=100)
@@ -142,48 +151,26 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    venues = load_venues_from_csv(args.input_file)
+    if args.force:
+        if not os.path.isfile(args.input_file):
+            logging.error(f"Input file does not exist: {args.input_file}")
+            sys.exit(1)
+        venues = load_venues_from_csv(args.input_file)
+    else:
+        venues = load_pending_venues_from_db(config_path=args.config)
     if args.limit > 0:
         venues = venues[:args.limit]
 
-    total = len(venues)
-    total_batches = (total + batch_size - 1) // batch_size
+    logging.info(f"--- Scopus venue collect: {len(venues)} venues, {workers} workers → {args.output_dir} ---")
 
-    logging.info(f"--- Scopus venue collect: {total} venues, {total_batches} batches, {workers} workers → {args.output_dir} ---")
+    with create_client(config, workers=workers, extra_headers=scopus_headers) as client:
+        def _process(venue, index, total_count):
+            return process_venue(client, venue, args.output_dir, args.force, index, total_count)
 
-    session = requests.Session()
-    session.headers.update(headers)
-
-    totals = {'success': 0, 'skipped': 0, 'not_found': 0, 'failed': 0}
-
-    for i in range(0, total, batch_size):
-        batch = venues[i:i + batch_size]
-        batch_num = (i // batch_size) + 1
-        batch_stats = {'success': 0, 'skipped': 0, 'not_found': 0, 'failed': 0}
-
-        logging.info(f"--- Batch {batch_num}/{total_batches} ({len(batch)} venues) ---")
-
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(process_venue, session, venue, args.output_dir,
-                                args.force, i + j + 1, total): venue
-                for j, venue in enumerate(batch)
-            }
-            for future in as_completed(futures):
-                venue = futures[future]
-                try:
-                    status = future.result()
-                    batch_stats[status] = batch_stats.get(status, 0) + 1
-                except Exception as e:
-                    logging.error(f"{venue.get('venue_id')} → Error: {e}")
-                    batch_stats['failed'] += 1
-
-        for k in totals:
-            totals[k] += batch_stats[k]
-
-        logging.info(f"--- Batch {batch_num} done: {batch_stats} | Total so far: {totals} ---")
-        if batch_num < total_batches:
-            time.sleep(pause)
+        totals = process_venues_batched(
+            venues, process_fn=_process,
+            workers=workers, batch_size=batch_size, pause=pause,
+        )
 
     logging.info(f"=== Finished: {totals} ===")
 

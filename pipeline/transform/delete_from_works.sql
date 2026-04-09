@@ -30,6 +30,15 @@ UPDATE works
 SET title = TRIM(REGEXP_REPLACE(title, '^[^[:alpha:]]+', ''))
 WHERE title REGEXP '^[^[:alpha:]]';
 
+-- Unicode adjustments
+UPDATE `works` 
+SET 
+    `title` = REPLACE(`title`, '...', '…'),
+    `subtitle` = REPLACE(`subtitle`, '...', '…')
+WHERE 
+    `title` LIKE '%...%' 
+    OR `subtitle` LIKE '%...%';
+
 
 -- ============================================================
 -- §1  DELETE JUNK / NON-SCHOLARLY WORKS
@@ -235,6 +244,42 @@ WHERE
     OR title REGEXP '[\\$£€]\\s*[0-9]+\\.[0-9]{2}'
 ;
 
+-- §1b  DELETE BOOK REVIEWS IDENTIFIABLE BY SUBTITLE CONTENT
+--
+-- After cleanup.py splits "Title: Subtitle", many book reviews end up as:
+--   title = "Book Title"
+--   subtitle = "By Author Name. Publisher, Year. 320 pp. $29.95"
+-- These are review citations, not genuine subtitles.
+
+-- Conservative: subtitle has BOTH publisher/pages AND "By/Edited by Author"
+DELETE w FROM works w
+WHERE w.subtitle IS NOT NULL
+  AND w.subtitle REGEXP '(University.*Press|Press|Publishers?|Verlag|\\. Pp\\.|, pp\\.|ISBN|\\$[0-9]+|£[0-9]+|\\(cloth\\)|\\(paper\\))'
+  AND w.subtitle REGEXP '\\. By [A-Z]|\\. Edited by [A-Z]|\\. Ed\\. by| By [A-Z].*Press'
+  AND w.work_type IN ('ARTICLE', 'CHAPTER');
+
+-- Broader: subtitle has publisher + pages/ISBN, long enough to be bibliographic citation
+DELETE w FROM works w
+WHERE w.subtitle IS NOT NULL
+  AND w.subtitle REGEXP '(University.*Press|\\. Pp\\.|, pp\\.|[0-9]+ pp|ISBN)'
+  AND LENGTH(w.subtitle) > 50
+  AND w.work_type IN ('ARTICLE', 'CHAPTER');
+
+-- Author-first format: "Author Name: Publisher, Year, NNN pp"
+DELETE w FROM works w
+WHERE w.subtitle IS NOT NULL
+  AND w.subtitle REGEXP '(Press|Publishers?|Books?).*[0-9]{4}'
+  AND w.subtitle REGEXP '[0-9]+\\s*pp'
+  AND LENGTH(w.subtitle) > 40
+  AND w.work_type IN ('ARTICLE', 'CHAPTER');
+
+-- Price in subtitle (bibliographic debris): "$29.95" / "£19.95"
+DELETE w FROM works w
+WHERE w.subtitle IS NOT NULL
+  AND w.subtitle REGEXP '[\\$£€]\\s*[0-9]+\\.[0-9]{2}'
+  AND w.subtitle REGEXP '(Press|Publishers?|pp\\.|ISBN)'
+  AND w.work_type IN ('ARTICLE', 'CHAPTER');
+
 
 -- ============================================================
 -- §2  NULLIFY PYTHON 'None' STRING LITERALS
@@ -330,3 +375,5 @@ WHERE p.open_access = 0
 CALL sp_clean_inconsistent_data();
 CALL sp_clean_orphaned_data();
 CALL sp_clean_orphaned_persons();
+CALL sp_review_reference_consistency(5000);
+ 
