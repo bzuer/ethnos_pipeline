@@ -210,6 +210,7 @@ WHERE
     OR title LIKE 'rezension:%'
     OR title LIKE 'rezensionen:%'
     OR title LIKE 'reviewed by %'
+    OR title LIKE 'review of%'
 
     -- Communications (anchored)
     OR title LIKE 'communications, comments%'

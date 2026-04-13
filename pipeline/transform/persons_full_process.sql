@@ -167,10 +167,7 @@ CALL sp_merge_persons_in_batches();
 -- [STEP 5a] Generate signatures (cursor-based, preserves compound hyphens, tiered particles)
 SELECT 'STEP 5a: Generating signatures (sp_generate_person_signatures)...' AS status;
 CALL sp_generate_person_signatures(NULL, 1);
-
--- [STEP 5b] Fix given_names / family_name (reverse-locate for case recovery)
-SELECT 'STEP 5b: Fixing given_names/family_name (sp_fix_person_name_parts)...' AS status;
-CALL sp_fix_person_name_parts(NULL, 1);
+TRUNCATE TABLE staging_person_signatures;
 
 
 -- PHASE 3: METRICS RECALCULATION

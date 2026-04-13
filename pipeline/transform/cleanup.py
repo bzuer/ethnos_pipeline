@@ -55,7 +55,18 @@ CORE_PROFILE_TABLES = [
     "venues", "subjects", "authorships", "files", "work_references",
 ]
 
-EXCLUDED_TABLES = {"processing_log", "sphinx_queue"}
+# Tables cleanup must not touch:
+# - summary_*: truncated and rebuilt by sp_orchestrate_all_summaries.
+# - subject_relevance_tiers / venue_ranking_rules / subject_stoplist:
+#   curated reference data — altering strings would corrupt the ranking rules.
+EXCLUDED_TABLES = {
+    "summary_publications",
+    "summary_venues",
+    "summary_persons",
+    "subject_relevance_tiers",
+    "venue_ranking_rules",
+    "subject_stoplist",
+}
 
 EXCLUDED_COLUMNS = {
     "id", "doi", "isbn", "issn", "eissn", "orcid", "ror_id",
@@ -310,6 +321,7 @@ def discover_target_columns(
          AND s.NON_UNIQUE = 0
         WHERE c.TABLE_SCHEMA = ?
           AND c.DATA_TYPE IN ('varchar','text','mediumtext','longtext')
+          AND c.EXTRA NOT LIKE '%GENERATED%'
         GROUP BY c.TABLE_NAME, c.COLUMN_NAME
         ORDER BY c.TABLE_NAME, c.COLUMN_NAME
         """,
@@ -723,8 +735,6 @@ def run_identifier_phase(
         ("persons", "orcid", normalize_orcid),
         ("venues", "issn", normalize_issn),
         ("venues", "eissn", normalize_issn),
-        ("staging_scielo_journals", "issn", normalize_issn),
-        ("staging_scielo_journals", "eissn", normalize_issn),
         ("publications", "isbn", normalize_isbn),
     ]
     for table, column, fn in id_targets:

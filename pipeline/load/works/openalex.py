@@ -653,18 +653,19 @@ def _process_record_no_tx(
         if not clean_title:
             return STATUS_SKIPPED
 
-    if mode != "fast":
-        if doi:
-            cursor.execute("SELECT p.work_id, p.id FROM publications p WHERE p.doi = ?", (doi,))
-            if result := cursor.fetchone():
-                if mode == "new":
-                    return STATUS_SKIPPED
-                work_id, publication_id = result
+    if mode != "fast" and doi:
+        cursor.execute("SELECT p.work_id, p.id FROM publications p WHERE p.doi = ?", (doi,))
+        if result := cursor.fetchone():
+            if mode == "new":
+                return STATUS_SKIPPED
+            work_id, publication_id = result
 
-        if not work_id and openalex_id:
-            cursor.execute("SELECT p.work_id, p.id FROM publications p WHERE p.openalex_id = ?", (openalex_id,))
-            if result_pub := cursor.fetchone():
-                work_id, publication_id = result_pub
+    # Fallback identifiers are only used when DOI is absent:
+    # DOI is the primary match key; openalex_id is a fallback key.
+    if not work_id and not doi and openalex_id:
+        cursor.execute("SELECT p.work_id, p.id FROM publications p WHERE p.openalex_id = ?", (openalex_id,))
+        if result_pub := cursor.fetchone():
+            work_id, publication_id = result_pub
 
     if not message:
         return STATUS_SKIPPED
