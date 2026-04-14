@@ -35,6 +35,11 @@ from pipeline.load.constants import (
     VENUE_TYPE_JOURNAL, VENUE_TYPE_CONFERENCE,
 )
 from pipeline.load.runner import run_work_loader, add_work_loader_arguments
+from pipeline.load.works.shared import (
+    confirm_author_count,
+    extract_crossref_contributors,
+    reconcile_resolved_authorships,
+)
 
 
 try:
@@ -399,72 +404,70 @@ def sync_publication_details(cursor: mariadb.Cursor, publication_id: int, messag
         logging.error(f"PUB {publication_id} error=unexpected detail={e}")
         return False
 
-def sync_authorships(cursor: mariadb.Cursor, work_id: int, authors_from_json: List[Dict], cache: Dict[str, Dict], is_new: bool = False) -> bool:
+def sync_authorships(
+    cursor: mariadb.Cursor,
+    work_id: int,
+    message: Dict,
+    cache: Dict[str, Dict],
+    is_new: bool = False,
+) -> bool:
+    del is_new  # Crossref contributor payloads are handled conservatively without delete semantics.
 
-    if not authors_from_json: return False
-    changes_made = False
+    contributors_from_json, unmapped_roles = extract_crossref_contributors(message or {})
+    if not contributors_from_json:
+        if unmapped_roles:
+            logging.debug(f"WORK {work_id}: unmapped contributor roles={unmapped_roles}")
+        return False
 
-    if is_new:
-        current_authors = {}
-    else:
-        try:
-            cursor.execute("SELECT person_id, position FROM authorships WHERE work_id = ? AND role = 'AUTHOR'", (work_id,))
-            current_authors = {row[0]: row[1] for row in cursor.fetchall()}
-        except mariadb.Error as e:
-            logging.error(f"WORK {work_id} error=authorships-select detail={e}")
-            return False
-
-    authors_to_add = []; authors_to_update = []
-    processed_person_ids = set()
-    duplicate_author_entries = 0
-    for i, author_data in enumerate(authors_from_json, 1):
-        person_id = get_or_create_person(cursor, author_data, cache)
-        if not person_id: continue
-        if person_id in processed_person_ids:
-            duplicate_author_entries += 1
+    resolved_contributors = []
+    unresolved_contributors = 0
+    for contributor in contributors_from_json:
+        person_data = contributor.get("person_data") or {}
+        person_id = get_or_create_person(cursor, person_data, cache)
+        if not person_id:
+            unresolved_contributors += 1
             continue
-        processed_person_ids.add(person_id)
 
-        affiliation_name = None
-        aff_list = author_data.get('affiliation') or []
-
-        if isinstance(aff_list, list) and aff_list and isinstance(aff_list[0], dict):
-             affiliation_name = aff_list[0].get('name')
-
-        affiliation_id = get_or_create_organization(cursor, affiliation_name, ORG_TYPE_INSTITUTE, cache)
-        is_corresponding = 0
-
-        if person_id not in current_authors:
-            authors_to_add.append((work_id, person_id, affiliation_id, i, is_corresponding))
-        elif current_authors[person_id] != i:
-            authors_to_update.append((affiliation_id, i, is_corresponding, work_id, person_id))
-
-    is_partial = bool(current_authors) and len(processed_person_ids) < len(current_authors)
-    if is_partial and authors_to_update:
-        logging.debug(
-            f"WORK {work_id}: skipped {len(authors_to_update)} authorship reorders from partial payload "
-            f"(payload={len(processed_person_ids)}, db={len(current_authors)})"
+        affiliation_id = get_or_create_organization(
+            cursor,
+            contributor.get("affiliation_name"),
+            ORG_TYPE_INSTITUTE,
+            cache,
         )
-        authors_to_update = []
+        resolved_contributors.append(
+            {
+                "person_id": person_id,
+                "role": contributor.get("role"),
+                "position": contributor.get("position"),
+                "affiliation_id": affiliation_id,
+                "is_corresponding": contributor.get("is_corresponding"),
+                "display_name": contributor.get("display_name"),
+            }
+        )
 
-    if authors_to_add:
-        try:
-            cursor.executemany("INSERT IGNORE INTO authorships (work_id, person_id, affiliation_id, position, is_corresponding, role) VALUES (?, ?, ?, ?, ?, 'AUTHOR')", authors_to_add)
-            changes_made = changes_made or cursor.rowcount > 0
-            if cursor.rowcount > 0:
-                logging.info(f"WORK {work_id}: inserted {cursor.rowcount}/{len(authors_to_add)} authorships")
-        except mariadb.Error as e: logging.error(f"WORK {work_id} error=authorships-insert detail={e}")
-    if authors_to_update:
-         try:
-             cursor.executemany("""UPDATE authorships SET affiliation_id = ?, position = ?, is_corresponding = ?
-                                   WHERE work_id = ? AND person_id = ? AND role = 'AUTHOR'""", authors_to_update)
-             changes_made = changes_made or cursor.rowcount > 0
-             if cursor.rowcount > 0:
-                 logging.info(f"WORK {work_id}: updated {cursor.rowcount}/{len(authors_to_update)} authorships")
-         except mariadb.Error as e: logging.error(f"WORK {work_id} error=authorships-update detail={e}")
-    if duplicate_author_entries:
-        logging.debug(f"WORK {work_id}: skipped {duplicate_author_entries} duplicate author entries (same person_id)")
-    return changes_made
+    if not resolved_contributors:
+        if unresolved_contributors:
+            logging.debug(f"WORK {work_id}: skipped {unresolved_contributors} unresolved contributors")
+        return False
+
+    try:
+        result = reconcile_resolved_authorships(cursor, work_id, resolved_contributors)
+    except mariadb.Error as e:
+        logging.error(f"WORK {work_id} error=authorships-reconcile detail={e}")
+        return False
+
+    if result["changed"]:
+        logging.info(
+            f"WORK {work_id}: authorships inserted={result['inserted']} "
+            f"updated={result['updated']} reclassified={result['reclassified']}"
+        )
+    if result["duplicates_skipped"]:
+        logging.debug(f"WORK {work_id}: skipped {result['duplicates_skipped']} duplicate contributor entries")
+    if unresolved_contributors:
+        logging.debug(f"WORK {work_id}: skipped {unresolved_contributors} unresolved contributors")
+    if unmapped_roles:
+        logging.debug(f"WORK {work_id}: unmapped contributor roles={unmapped_roles}")
+    return result["changed"]
 
 def sync_funding(cursor: mariadb.Cursor, work_id: int, funders_from_json: List[Dict], cache: Dict[str, Dict], is_new: bool = False) -> bool:
 
@@ -694,6 +697,8 @@ def _process_record_no_tx(
         result = cursor.fetchone()
         if result and mode == "new":
             return STATUS_SKIPPED, None, None, doi
+        if not result and mode == "update":
+            return STATUS_SKIPPED, None, None, doi
 
     if result:
         work_id, publication_id, current_title, current_work_type, current_abstract = result
@@ -725,12 +730,18 @@ def _process_record_no_tx(
         changes = [data_changed]
         changes.append(sync_work_details(cursor, work_id, message))
         changes.append(sync_publication_details(cursor, publication_id, message, cache))
-        changes.append(sync_authorships(cursor, work_id, message.get("author") or [], cache))
+        changes.append(sync_authorships(cursor, work_id, message, cache))
         changes.append(sync_citations(cursor, work_id, message.get("reference") or []))
         changes.append(sync_funding(cursor, work_id, message.get("funder") or [], cache))
         changes.append(sync_licenses(cursor, publication_id, message.get("license") or []))
         changes.append(sync_subjects(cursor, work_id, message.get("subject") or [], cache))
         changes.append(sync_crossref_files(cursor, publication_id, message))
+
+        if mode == "update":
+            expected_authors = sum(
+                1 for entry in (message.get("author") or []) if isinstance(entry, dict)
+            )
+            confirm_author_count(cursor, work_id, expected_authors, "crossref")
 
         status = STATUS_UPDATED if any(changes) else STATUS_NO_CHANGE
         if any(changes):
@@ -763,7 +774,7 @@ def _process_record_no_tx(
 
     sync_work_details(cursor, work_id, message)
     sync_publication_details(cursor, publication_id, message, cache)
-    sync_authorships(cursor, work_id, message.get("author") or [], cache, is_new=True)
+    sync_authorships(cursor, work_id, message, cache, is_new=True)
     sync_citations(cursor, work_id, message.get("reference") or [], is_new=True)
     sync_funding(cursor, work_id, message.get("funder") or [], cache, is_new=True)
     sync_licenses(cursor, publication_id, message.get("license") or [])

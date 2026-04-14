@@ -35,6 +35,10 @@ from pipeline.load.constants import (
     VENUE_TYPE_REPOSITORY, VENUE_TYPE_OTHER,
 )
 from pipeline.load.runner import run_work_loader, add_work_loader_arguments
+from pipeline.load.works.shared import (
+    confirm_author_count,
+    reconcile_resolved_authorships,
+)
 
 
 try:
@@ -293,32 +297,27 @@ def sync_publication_details(cursor: mariadb.Cursor, publication_id: int, messag
         return False
 
 def sync_authorships(cursor: mariadb.Cursor, work_id: int, authorships_from_json: List[Dict], cache: Dict[str, Dict], is_new: bool = False) -> bool:
-    if not authorships_from_json: return False
-    changes_made = False
-    if is_new:
-        current_authors = {}
-    else:
-        try:
-            cursor.execute("SELECT person_id, position FROM authorships WHERE work_id = ? AND role = 'AUTHOR'", (work_id,))
-            current_authors = {row[0]: row[1] for row in cursor.fetchall()}
-        except mariadb.Error as e:
-            logging.error(f"WORK {work_id} error=authorships-select detail={e}")
-            return False
+    del is_new  # OpenAlex payload remains author-only; reconcile helper handles reruns safely.
 
-    authors_to_add, authors_to_update = [], []
-    processed_person_ids = set()
+    if not authorships_from_json:
+        return False
+
+    resolved_contributors = []
     duplicate_author_entries = 0
+    processed_person_ids = set()
     for i, authorship_item in enumerate(authorships_from_json, 1):
         author_data = authorship_item.get('author') or {}
-        if not author_data: continue
-        
+        if not author_data:
+            continue
+
         person_id = get_or_create_person(cursor, author_data, cache)
-        if not person_id: continue
+        if not person_id:
+            continue
         if person_id in processed_person_ids:
             duplicate_author_entries += 1
             continue
         processed_person_ids.add(person_id)
-        
+
         affiliation_name = None
         affiliation_openalex_id = None
         affiliation_ror_id = None
@@ -344,34 +343,40 @@ def sync_authorships(cursor: mariadb.Cursor, work_id: int, authorships_from_json
             openalex_id=affiliation_openalex_id,
             country_code=affiliation_country,
         )
-        
-        is_corresponding = 1 if authorship_item.get('is_corresponding') else 0
-        if person_id not in current_authors: 
-            authors_to_add.append((work_id, person_id, affiliation_id, i, is_corresponding))
-        elif current_authors[person_id] != i: 
-            authors_to_update.append((affiliation_id, i, is_corresponding, work_id, person_id))
-            
-    is_partial_authorship_payload = bool(current_authors) and len(processed_person_ids) < len(current_authors)
-    if is_partial_authorship_payload and authors_to_update:
-        logging.debug(
-            f"WORK {work_id}: skipped {len(authors_to_update)} authorship reorders from partial payload "
-            f"(payload_authors={len(processed_person_ids)}, current_authors={len(current_authors)})"
-        )
-        authors_to_update = []
 
-    if authors_to_add:
-        cursor.executemany("INSERT IGNORE INTO authorships (work_id, person_id, affiliation_id, position, is_corresponding, role) VALUES (?, ?, ?, ?, ?, 'AUTHOR')", authors_to_add)
-        changes_made = changes_made or cursor.rowcount > 0
-        if cursor.rowcount > 0:
-            logging.info(f"WORK {work_id}: inserted {cursor.rowcount}/{len(authors_to_add)} authorships")
-    if authors_to_update:
-         cursor.executemany("""UPDATE authorships SET affiliation_id = ?, position = ?, is_corresponding = ? WHERE work_id = ? AND person_id = ? AND role = 'AUTHOR'""", authors_to_update)
-         changes_made = changes_made or cursor.rowcount > 0
-         if cursor.rowcount > 0:
-             logging.info(f"WORK {work_id}: updated {cursor.rowcount}/{len(authors_to_update)} authorships")
+        resolved_contributors.append(
+            {
+                "person_id": person_id,
+                "role": "AUTHOR",
+                "position": i,
+                "affiliation_id": affiliation_id,
+                "is_corresponding": 1 if authorship_item.get('is_corresponding') else 0,
+                "display_name": author_data.get("display_name"),
+            }
+        )
+
+    if not resolved_contributors:
+        return False
+
+    try:
+        result = reconcile_resolved_authorships(
+            cursor,
+            work_id,
+            resolved_contributors,
+            allow_reclassification=False,
+        )
+    except mariadb.Error as e:
+        logging.error(f"WORK {work_id} error=authorships-reconcile detail={e}")
+        return False
+
+    if result["changed"]:
+        logging.info(
+            f"WORK {work_id}: authorships inserted={result['inserted']} "
+            f"updated={result['updated']} reclassified={result['reclassified']}"
+        )
     if duplicate_author_entries:
         logging.debug(f"WORK {work_id}: skipped {duplicate_author_entries} duplicate author entries (same person_id)")
-    return changes_made
+    return result["changed"]
 
 def sync_funding(cursor: mariadb.Cursor, work_id: int, funders_from_json: List[Dict], cache: Dict[str, Dict], is_new: bool = False) -> bool:
     if not funders_from_json: return False
@@ -667,6 +672,9 @@ def _process_record_no_tx(
         if result_pub := cursor.fetchone():
             work_id, publication_id = result_pub
 
+    if mode == "update" and not work_id:
+        return STATUS_SKIPPED
+
     if not message:
         return STATUS_SKIPPED
 
@@ -717,6 +725,12 @@ def _process_record_no_tx(
         changes.append(sync_topics_hierarchical(cursor, work_id, message.get('topics') or []))
         changes.append(sync_keywords(cursor, work_id, message.get('keywords') or [], cache))
         changes.append(sync_best_oa_file(cursor, publication_id, message))
+
+        if mode == "update":
+            expected_authors = sum(
+                1 for entry in (message.get('authorships') or []) if isinstance(entry, dict)
+            )
+            confirm_author_count(cursor, work_id, expected_authors, "openalex")
 
         status = STATUS_UPDATED if any(changes) else STATUS_NO_CHANGE
         if any(changes):

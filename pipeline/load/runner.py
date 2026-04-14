@@ -23,7 +23,8 @@ from pipeline.load.constants import (
     STATUS_SKIPPED, STATUS_ERROR,
 )
 from pipeline.load.works.shared import (
-    should_skip_existing_doi, mark_doi_processed, bulk_filter_new_files,
+    should_skip_existing_doi, mark_doi_processed,
+    bulk_filter_new_files, bulk_filter_update_files,
 )
 
 
@@ -89,17 +90,24 @@ def run_work_loader(
             all_json_files = collect_json_files(subdir_path, args.limit)
             total_files_in_folder = len(all_json_files)
 
-            # --mode fast: bulk-filter via filename DOIs before any JSON parsing
-            if args.mode == "fast" and total_files_in_folder > 0:
-                fast_cursor = conn.cursor()
-                all_json_files, fast_skipped = bulk_filter_new_files(
-                    fast_cursor, all_json_files, doi_presence_cache,
-                )
-                fast_cursor.close()
-                counters['skipped'] += fast_skipped
+            # --mode fast/update: bulk-filter via filename DOIs before any JSON parsing
+            if args.mode in ("fast", "update") and total_files_in_folder > 0:
+                pre_cursor = conn.cursor()
+                if args.mode == "fast":
+                    all_json_files, pre_skipped = bulk_filter_new_files(
+                        pre_cursor, all_json_files, doi_presence_cache,
+                    )
+                else:
+                    all_json_files, pre_skipped = bulk_filter_update_files(
+                        pre_cursor, all_json_files, doi_presence_cache,
+                    )
+                pre_cursor.close()
+                counters['skipped'] += pre_skipped
                 total_files_in_folder = len(all_json_files)
                 if total_files_in_folder == 0:
-                    logging.info(f"FAST folder={folder_name} all DOIs exist, skipping entirely")
+                    label = "FAST" if args.mode == "fast" else "UPDATE"
+                    reason = "all DOIs exist" if args.mode == "fast" else "no existing DOIs"
+                    logging.info(f"{label} folder={folder_name} {reason}, skipping entirely")
                     continue
 
             logging.info(f"Processing {total_files_in_folder} files in {folder_name}...")
@@ -313,8 +321,8 @@ def _run_per_file_mode(conn, args, all_json_files, total_files_in_folder,
 def add_work_loader_arguments(parser: argparse.ArgumentParser) -> None:
     """Add the standard CLI arguments shared by all work loaders."""
     parser.add_argument("directory", help="Root directory with subfolders containing .json files.")
-    parser.add_argument("--mode", choices=["new", "full", "fast"], default="new",
-                        help="Ingest mode: new=only new DOIs, full=all records, fast=bulk DOI pre-check (no JSON parse for existing).")
+    parser.add_argument("--mode", choices=["new", "full", "fast", "update"], default="new",
+                        help="Ingest mode: new=only new DOIs, full=all records, fast=bulk DOI pre-check (no JSON parse for existing), update=only update publications already in DB (no inserts).")
     parser.add_argument("--limit", type=int,
                         help="Limit files processed per folder.")
     parser.add_argument("--commit-batch", type=int, default=250,
