@@ -35,10 +35,7 @@ from pipeline.load.constants import (
     VENUE_TYPE_REPOSITORY, VENUE_TYPE_OTHER,
 )
 from pipeline.load.runner import run_work_loader, add_work_loader_arguments
-from pipeline.load.works.shared import (
-    confirm_author_count,
-    reconcile_resolved_authorships,
-)
+from pipeline.load.works.shared import reconcile_resolved_authorships
 
 
 try:
@@ -718,19 +715,14 @@ def _process_record_no_tx(
 
         changes = [changes_made]
         changes.append(sync_publication_details(cursor, publication_id, message, doi, openalex_id, cache))
-        changes.append(sync_authorships(cursor, work_id, message.get('authorships') or [], cache))
+        if mode != "update":
+            changes.append(sync_authorships(cursor, work_id, message.get('authorships') or [], cache))
         changes.append(sync_citations(cursor, work_id, message.get('referenced_works') or []))
         changes.append(sync_funding(cursor, work_id, message.get('grants') or [], cache))
         changes.append(sync_licenses(cursor, publication_id, message.get('primary_location')))
         changes.append(sync_topics_hierarchical(cursor, work_id, message.get('topics') or []))
         changes.append(sync_keywords(cursor, work_id, message.get('keywords') or [], cache))
         changes.append(sync_best_oa_file(cursor, publication_id, message))
-
-        if mode == "update":
-            expected_authors = sum(
-                1 for entry in (message.get('authorships') or []) if isinstance(entry, dict)
-            )
-            confirm_author_count(cursor, work_id, expected_authors, "openalex")
 
         status = STATUS_UPDATED if any(changes) else STATUS_NO_CHANGE
         if any(changes):

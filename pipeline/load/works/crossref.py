@@ -36,7 +36,6 @@ from pipeline.load.constants import (
 )
 from pipeline.load.runner import run_work_loader, add_work_loader_arguments
 from pipeline.load.works.shared import (
-    confirm_author_count,
     extract_crossref_contributors,
     reconcile_resolved_authorships,
 )
@@ -730,18 +729,13 @@ def _process_record_no_tx(
         changes = [data_changed]
         changes.append(sync_work_details(cursor, work_id, message))
         changes.append(sync_publication_details(cursor, publication_id, message, cache))
-        changes.append(sync_authorships(cursor, work_id, message, cache))
+        if mode != "update":
+            changes.append(sync_authorships(cursor, work_id, message, cache))
         changes.append(sync_citations(cursor, work_id, message.get("reference") or []))
         changes.append(sync_funding(cursor, work_id, message.get("funder") or [], cache))
         changes.append(sync_licenses(cursor, publication_id, message.get("license") or []))
         changes.append(sync_subjects(cursor, work_id, message.get("subject") or [], cache))
         changes.append(sync_crossref_files(cursor, publication_id, message))
-
-        if mode == "update":
-            expected_authors = sum(
-                1 for entry in (message.get("author") or []) if isinstance(entry, dict)
-            )
-            confirm_author_count(cursor, work_id, expected_authors, "crossref")
 
         status = STATUS_UPDATED if any(changes) else STATUS_NO_CHANGE
         if any(changes):

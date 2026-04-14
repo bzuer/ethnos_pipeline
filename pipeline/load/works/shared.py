@@ -179,38 +179,6 @@ def bulk_filter_update_files(
     return keep_files, skipped
 
 
-def confirm_author_count(
-    cursor: mariadb.Cursor,
-    work_id: Optional[int],
-    expected_author_count: Optional[int],
-    source: str,
-) -> Optional[int]:
-    """Confirm the DB AUTHOR count matches the payload; log a warning on drift.
-
-    Called from update mode after the idempotent sync helpers have run, so the
-    DB row reflects every contributor the payload could resolve. Any residual
-    mismatch points to unresolved persons, stale rows, or source drift.
-    """
-    if not work_id or expected_author_count is None:
-        return None
-    try:
-        cursor.execute(
-            "SELECT COUNT(*) FROM authorships WHERE work_id = ? AND role = 'AUTHOR'",
-            (work_id,),
-        )
-        row = cursor.fetchone()
-        actual = int(row[0] or 0) if row else 0
-    except mariadb.Error as e:
-        logging.error(f"WORK {work_id} error=author-count detail={e}")
-        return None
-    if actual != expected_author_count:
-        logging.warning(
-            f"WORK {work_id} source={source} author_count_mismatch "
-            f"expected={expected_author_count} db={actual}"
-        )
-    return actual
-
-
 # ---------------------------------------------------------------------------
 # Authorship-role helpers
 # ---------------------------------------------------------------------------
