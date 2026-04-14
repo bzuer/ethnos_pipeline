@@ -1,6 +1,26 @@
 -- ============================================================
--- DATA CLEANUP SCRIPT — adjusted
--- Target: MariaDB 11.8+ (collation uca1400_ai_ci)
+-- delete_from_works.sql — optional junk / boilerplate cleanup
+--
+-- NOT part of pipeline_processor.sql. Run on demand only after a back-up.
+-- Target: MariaDB 11.8+ (collation uca1400_ai_ci).
+--
+-- Scope:
+--   §0 — strip leading "Abstract:"/"Resumen:" and leading punctuation noise
+--        from works.abstract/title; normalise ellipsis unicode.
+--   §1 — delete works whose title is editorial boilerplate (front/back matter,
+--        TOC, "Editorial", "Book Review: ...", corrigenda, etc.).
+--   §1b — delete works whose subtitle matches a bibliographic review citation
+--         (ARTICLE/CHAPTER only).
+--   §2 — orphan cleanup for rows that sp_clean_core_data does NOT cover
+--        (works without authorship, venues/organizations/subjects without any
+--        references to them).
+--   §3 — propagate open_access = 1 from venues / licenses / SciELO PIDs.
+--
+-- Redundant content removed: the "None"-literal nullification block (handled
+-- by sp_normalize_publications_data) and calls to dropped procedures
+-- (sp_clean_inconsistent_data / sp_clean_orphaned_data / sp_clean_orphaned_persons).
+-- The former sphinx_queue orphan clean-up is gone because the table no
+-- longer exists.
 -- ============================================================
 
 -- ============================================================
@@ -283,68 +303,33 @@ WHERE w.subtitle IS NOT NULL
 
 
 -- ============================================================
--- §2  NULLIFY PYTHON 'None' STRING LITERALS
+-- §2  ORPHAN REMOVAL (LEFT JOIN for performance)
+--     Complements sp_clean_core_data, which does not touch works,
+--     venues, organizations, subjects or files.
 -- ============================================================
 
-UPDATE publications
-SET
-    volume         = NULLIF(volume, 'None'),
-    pmid           = NULLIF(pmid, 'None'),
-    pmcid          = NULLIF(pmcid, 'None'),
-    isbn           = NULLIF(isbn, 'None'),
-    asin           = NULLIF(asin, 'None'),
-    udc            = NULLIF(udc, 'None'),
-    lbc            = NULLIF(lbc, 'None'),
-    ddc            = NULLIF(ddc, 'None'),
-    lcc            = NULLIF(lcc, 'None'),
-    google_book_id = NULLIF(google_book_id, 'None')
-WHERE
-    volume = 'None' OR pmid = 'None' OR pmcid = 'None' OR isbn = 'None'
-    OR asin = 'None' OR udc = 'None' OR lbc = 'None'
-    OR ddc = 'None' OR lcc = 'None' OR google_book_id = 'None';
-
-UPDATE files
-SET
-    language = NULLIF(language, 'None'),
-    sha1     = NULLIF(sha1, 'None'),
-    sha256   = NULLIF(sha256, 'None'),
-    ipfs_cid = NULLIF(ipfs_cid, 'None')
-WHERE
-    language = 'None' OR sha1 = 'None' OR sha256 = 'None' OR ipfs_cid = 'None';
--- file_format is ENUM — 'None' would fail on INSERT; handle separately if present.
-
-
--- ============================================================
--- §3  ORPHAN REMOVAL (LEFT JOIN for performance)
--- ============================================================
-
--- 3a. Works without any authorship
+-- 2a. Works without any authorship
 DELETE w FROM works w
 LEFT JOIN authorships a ON a.work_id = w.id
 WHERE a.work_id IS NULL;
 
--- 3b. Files pointing to nonexistent publications
+-- 2b. Files pointing to nonexistent publications
 DELETE f FROM files f
 LEFT JOIN publications p ON f.publication_id = p.id
 WHERE p.id IS NULL;
 
--- 3c. Sphinx queue entries for deleted works
-DELETE sq FROM sphinx_queue sq
-LEFT JOIN works w ON sq.work_id = w.id
-WHERE w.id IS NULL;
-
--- 3d. Venues with zero publications
+-- 2c. Venues with zero publications
 DELETE v FROM venues v
 LEFT JOIN publications p ON p.venue_id = v.id
 WHERE p.venue_id IS NULL;
 
--- 3e. Subjects with zero associations
+-- 2d. Subjects with zero associations
 DELETE s FROM subjects s
 LEFT JOIN work_subjects  ws ON ws.subject_id = s.id
 LEFT JOIN venue_subjects vs ON vs.subject_id = s.id
 WHERE ws.subject_id IS NULL AND vs.subject_id IS NULL;
 
--- 3f. Organizations with no references anywhere (single pass)
+-- 2e. Organizations with no references anywhere (single pass)
 DELETE o FROM organizations o
 LEFT JOIN authorships  a   ON o.id = a.affiliation_id
 LEFT JOIN funding      f   ON o.id = f.funder_id
@@ -359,7 +344,7 @@ WHERE a.affiliation_id  IS NULL
 
 
 -- ============================================================
--- §4  OPEN ACCESS PROPAGATION
+-- §3  OPEN ACCESS PROPAGATION
 -- ============================================================
 
 UPDATE publications p
@@ -367,14 +352,3 @@ JOIN venues v ON p.venue_id = v.id
 SET p.open_access = 1
 WHERE p.open_access = 0
   AND (v.open_access = 1 OR p.license_url IS NOT NULL OR p.scielo_pid IS NOT NULL);
-
-
--- ============================================================
--- §5  CONSISTENCY PROCEDURES
--- ============================================================
-
-CALL sp_clean_inconsistent_data();
-CALL sp_clean_orphaned_data();
-CALL sp_clean_orphaned_persons();
-CALL sp_review_reference_consistency(5000);
- 

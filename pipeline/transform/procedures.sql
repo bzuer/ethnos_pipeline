@@ -1,70 +1,401 @@
--- =============================================================================
--- Stored procedures called by transform scripts.
+-- ============================================================================
+-- pipeline/transform/procedures.sql
 --
--- Callers:
---   delete_from_works.sql  : sp_clean_inconsistent_data, sp_clean_orphaned_data, sp_clean_orphaned_persons,
---                            sp_review_reference_consistency
---   persons_full_process.sql: sp_merge_persons_in_batches, sp_generate_person_signatures, sp_fix_person_name_parts
---   metrics.py             : sp_update_persons_summary, sp_update_10yr_impact_factors,
---                            sp_populate_sphinx_venues_summary, sp_update_work_author_summary_all,
---                            sp_update_work_subjects_summary_all, sp_update_works_summary
---   (sp_run_full_recalculation is obsolete — preserved for reference only)
+-- Source-controlled copies of the procedures and functions that drive the
+-- transform stage, plus a handful of repair/maintenance helpers. Every
+-- definition here is a verbatim dump of the live DB routine (definer clause
+-- stripped for portability). Run with:
 --
--- Run: mariadb data < pipeline/transform/procedures.sql
--- =============================================================================
+--   mariadb data < pipeline/transform/procedures.sql
+--
+-- The four summary / ranking procedures live in their own files:
+--   sp_build_summary_publications.sql
+--   sp_build_summary_venues.sql
+--   sp_build_summary_persons.sql
+--   venue_ranking_setup.sql (sp_calculate_venue_ranking + tier seed)
+-- ============================================================================
 
 DELIMITER $$
 
--- ===========================================================================
--- Called by: delete_from_works.sql
--- ===========================================================================
+-- ---- sp_clean_html_entities ---------------------------------------------------------
+-- Phase 1 — HTML entity cleanup on works/orgs/venues/persons text.
+DROP PROCEDURE IF EXISTS `sp_clean_html_entities`$$
+CREATE PROCEDURE `sp_clean_html_entities`()
+BEGIN
+    DECLARE total_cleaned INT DEFAULT 0;
+    
+    START TRANSACTION;
+    
+    
+    UPDATE IGNORE works SET title = TRIM(REPLACE(REPLACE(title, '&amp;', '&'), '&nbsp;', ' ')) WHERE title REGEXP '&[a-zA-Z0-9#]+;';
+    SET total_cleaned = total_cleaned + ROW_COUNT();
+    
+    UPDATE IGNORE works SET abstract = TRIM(REPLACE(REPLACE(abstract, '&amp;', '&'), '&nbsp;', ' ')) WHERE abstract REGEXP '&[a-zA-Z0-9#]+;' AND abstract IS NOT NULL;
+    SET total_cleaned = total_cleaned + ROW_COUNT();
+    
+    UPDATE IGNORE organizations SET name = TRIM(REPLACE(REPLACE(name, '&amp;', '&'), '&nbsp;', ' ')) WHERE name REGEXP '&[a-zA-Z0-9#]+;';
+    SET total_cleaned = total_cleaned + ROW_COUNT();
+    
+    UPDATE IGNORE venues SET name = TRIM(REPLACE(REPLACE(name, '&amp;', '&'), '&nbsp;', ' ')) WHERE name REGEXP '&[a-zA-Z0-9#]+;';
+    SET total_cleaned = total_cleaned + ROW_COUNT();
+    
+    UPDATE IGNORE persons SET preferred_name = TRIM(REPLACE(REPLACE(preferred_name, '&amp;', '&'), '&nbsp;', ' ')) WHERE preferred_name REGEXP '&[a-zA-Z0-9#]+;' AND preferred_name IS NOT NULL;
+    SET total_cleaned = total_cleaned + ROW_COUNT();
+    
+    COMMIT;
+    
+    SELECT CONCAT('HTML entities cleaned (com IGNORE): ', total_cleaned, ' records afetados') as result;
+END $$
 
-DROP PROCEDURE IF EXISTS `sp_clean_inconsistent_data`$$
-CREATE PROCEDURE `sp_clean_inconsistent_data`()
+-- ---- sp_normalize_publications_data ---------------------------------------------------------
+-- Phase 1 — normalize publication metadata, DOIs, etc.
+DROP PROCEDURE IF EXISTS `sp_normalize_publications_data`$$
+CREATE PROCEDURE `sp_normalize_publications_data`()
 BEGIN
     
-    DELETE a FROM authorships a
-    LEFT JOIN works w ON a.work_id = w.id
-    LEFT JOIN persons p ON a.person_id = p.id
-    WHERE w.id IS NULL OR p.id IS NULL;
     
-    
-    DELETE pub FROM publications pub
-    LEFT JOIN works w ON pub.work_id = w.id
-    WHERE w.id IS NULL;
-    
-    
-    DELETE c FROM courses c
-    LEFT JOIN programs p ON c.program_id = p.id
-    WHERE p.id IS NULL;
-    
-    SELECT CONCAT('Dados inconsistentes removidos: ', ROW_COUNT()) AS result;
-END ;;$$
+    UPDATE publications
+    SET 
+        pmid = CASE WHEN LOWER(pmid) IN ('none', 'null', 'nan', '') THEN NULL ELSE pmid END,
+        pmcid = CASE WHEN LOWER(pmcid) IN ('none', 'null', 'nan', '') THEN NULL ELSE pmcid END,
+        isbn = CASE WHEN LOWER(isbn) IN ('none', 'null', 'nan', '') THEN NULL ELSE isbn END,
+        asin = CASE WHEN LOWER(asin) IN ('none', 'null', 'nan', '') THEN NULL ELSE asin END,
+        udc = CASE WHEN LOWER(udc) IN ('none', 'null', 'nan', '') THEN NULL ELSE udc END,
+        lbc = CASE WHEN LOWER(lbc) IN ('none', 'null', 'nan', '') THEN NULL ELSE lbc END,
+        ddc = CASE WHEN LOWER(ddc) IN ('none', 'null', 'nan', '') THEN NULL ELSE ddc END,
+        lcc = CASE WHEN LOWER(lcc) IN ('none', 'null', 'nan', '') THEN NULL ELSE lcc END,
+        google_book_id = CASE WHEN LOWER(google_book_id) IN ('none', 'null', 'nan', '') THEN NULL ELSE google_book_id END,
+        volume = CASE WHEN LOWER(volume) IN ('none', 'null', 'nan', '') THEN NULL ELSE volume END,
+        issue = CASE WHEN LOWER(issue) IN ('none', 'null', 'nan', '') THEN NULL ELSE issue END,
+        pages = CASE WHEN LOWER(pages) IN ('none', 'null', 'nan', '') THEN NULL ELSE pages END
+    WHERE 
+        LOWER(pmid) IN ('none', 'null', 'nan', '') OR
+        LOWER(pmcid) IN ('none', 'null', 'nan', '') OR
+        LOWER(isbn) IN ('none', 'null', 'nan', '') OR
+        LOWER(asin) IN ('none', 'null', 'nan', '') OR
+        LOWER(udc) IN ('none', 'null', 'nan', '') OR
+        LOWER(lbc) IN ('none', 'null', 'nan', '') OR
+        LOWER(ddc) IN ('none', 'null', 'nan', '') OR
+        LOWER(lcc) IN ('none', 'null', 'nan', '') OR
+        LOWER(google_book_id) IN ('none', 'null', 'nan', '') OR
+        LOWER(volume) IN ('none', 'null', 'nan', '') OR
+        LOWER(issue) IN ('none', 'null', 'nan', '') OR
+        LOWER(pages) IN ('none', 'null', 'nan', '');
 
-DROP PROCEDURE IF EXISTS `sp_clean_orphaned_data`$$
-CREATE PROCEDURE `sp_clean_orphaned_data`()
-BEGIN
-    DELETE was FROM work_author_summary was LEFT JOIN works w ON was.work_id = w.id WHERE w.id IS NULL;
-    DELETE a FROM authorships a LEFT JOIN works w ON a.work_id = w.id LEFT JOIN persons p ON a.person_id = p.id WHERE w.id IS NULL OR p.id IS NULL;
-    SELECT 'Limpeza de dados órfãos concluída.' AS result;
-END ;;$$
+    
+    
+    UPDATE publications
+    SET volume = NULL
+    WHERE volume LIKE '10.%/%';
 
-DROP PROCEDURE IF EXISTS `sp_clean_orphaned_persons`$$
-CREATE PROCEDURE `sp_clean_orphaned_persons`()
+    UPDATE publications
+    SET issue = NULL
+    WHERE issue LIKE '10.%/%';
+
+    
+    
+    UPDATE publications
+    SET isbn = LEFT(REPLACE(SUBSTRING_INDEX(isbn, ',', 1), '-', ''), 20)
+    WHERE isbn LIKE '%-%' OR isbn LIKE '%,%';
+
+    
+    
+    UPDATE publications
+    SET pages = TRIM(REGEXP_REPLACE(pages, '(?i)\\s+p\\.?$|\\s+pp\\.?$', ''))
+    WHERE pages REGEXP '(?i)\\s+p\\.?$|\\s+pp\\.?$';
+
+    
+    UPDATE publications
+    SET pages = TRIM(pages)
+    WHERE pages != TRIM(pages);
+
+    
+    SELECT 'Procedimento de normalização dos metadados concluído com sucesso.' AS status;
+END $$
+
+-- ---- sp_clean_split_compound_persons ---------------------------------------------------------
+-- Phase 1 — split compound person names conservatively.
+DROP PROCEDURE IF EXISTS `sp_clean_split_compound_persons`$$
+CREATE PROCEDURE `sp_clean_split_compound_persons`()
 BEGIN
     
+    CREATE TEMPORARY TABLE temp_split_names AS
+    WITH RECURSIVE name_splitter AS (
+        SELECT 
+            id AS original_person_id,
+            TRIM(SUBSTRING_INDEX(preferred_name, ',', 1)) AS extracted_name,
+            TRIM(SUBSTRING(preferred_name, LENGTH(SUBSTRING_INDEX(preferred_name, ',', 1)) + 2)) AS remainder
+        FROM persons
+        WHERE preferred_name LIKE '%,%'
+        
+        UNION ALL
+        
+        SELECT 
+            original_person_id,
+            TRIM(SUBSTRING_INDEX(remainder, ',', 1)),
+            TRIM(SUBSTRING(remainder, LENGTH(SUBSTRING_INDEX(remainder, ',', 1)) + 2))
+        FROM name_splitter
+        WHERE remainder != ''
+    )
+    SELECT original_person_id, extracted_name 
+    FROM name_splitter 
+    WHERE extracted_name != '';
+
+    
+    INSERT IGNORE INTO persons (preferred_name)
+    SELECT DISTINCT extracted_name FROM temp_split_names;
+
+    
+    INSERT IGNORE INTO authorships (work_id, person_id, role, position)
+    SELECT a.work_id, p_new.id, 'AUTHOR', 99
+    FROM authorships a
+    JOIN temp_split_names tsn ON a.person_id = tsn.original_person_id
+    JOIN persons p_new ON p_new.preferred_name = tsn.extracted_name COLLATE utf8mb4_unicode_ci;
+
     
     DELETE p FROM persons p
-    LEFT JOIN authorships a ON p.id = a.person_id
-    WHERE a.work_id IS NULL;
-END ;;$$
+    JOIN (SELECT DISTINCT original_person_id FROM temp_split_names) del_list 
+      ON p.id = del_list.original_person_id;
 
+    DROP TEMPORARY TABLE temp_split_names;
+END $$
+
+-- ---- sp_clean_core_data ---------------------------------------------------------
+-- Phase 2 — cascade-delete orphan authorships/publications/refs/persons.
+DROP PROCEDURE IF EXISTS `sp_clean_core_data`$$
+CREATE PROCEDURE `sp_clean_core_data`()
+BEGIN
+    DELETE a FROM authorships a LEFT JOIN works w ON a.work_id = w.id WHERE w.id IS NULL;
+    DELETE a FROM authorships a LEFT JOIN persons p ON a.person_id = p.id WHERE p.id IS NULL;
+    DELETE pub FROM publications pub LEFT JOIN works w ON pub.work_id = w.id WHERE w.id IS NULL;
+    DELETE cb FROM course_bibliography cb LEFT JOIN works w ON cb.work_id = w.id WHERE w.id IS NULL;
+    DELETE f FROM funding f LEFT JOIN works w ON f.work_id = w.id WHERE w.id IS NULL;
+    DELETE wr FROM work_references wr LEFT JOIN works w ON wr.citing_work_id = w.id WHERE w.id IS NULL;
+    
+    DELETE p FROM persons p 
+    LEFT JOIN authorships a ON p.id = a.person_id 
+    LEFT JOIN course_instructors ci ON p.id = ci.person_id 
+    WHERE a.work_id IS NULL AND ci.course_id IS NULL;
+END $$
+
+-- ---- sp_rebuild_signatures ---------------------------------------------------------
+-- Phase 2 — cursor-based rebuild of persons.signature_id.
+DROP PROCEDURE IF EXISTS `sp_rebuild_signatures`$$
+CREATE PROCEDURE `sp_rebuild_signatures`()
+BEGIN
+    DECLARE v_id INT;
+    DECLARE v_preferred_name VARCHAR(255);
+    DECLARE v_clean VARCHAR(500);
+    DECLARE v_last_name VARCHAR(255);
+    DECLARE v_given_upper VARCHAR(500);
+    DECLARE v_initials VARCHAR(255);
+    DECLARE v_particle VARCHAR(255);
+    DECLARE v_signature VARCHAR(255);
+    DECLARE v_done INT DEFAULT 0;
+
+    DECLARE cur CURSOR FOR
+        SELECT id, preferred_name
+        FROM persons
+        WHERE preferred_name IS NOT NULL
+          AND TRIM(preferred_name) != '';
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
+
+    DROP TEMPORARY TABLE IF EXISTS tmp_signatures;
+    CREATE TEMPORARY TABLE tmp_signatures (
+        person_id INT PRIMARY KEY,
+        signature_string VARCHAR(255)
+    ) ENGINE=InnoDB;
+
+    OPEN cur;
+
+    read_loop: LOOP
+        FETCH cur INTO v_id, v_preferred_name;
+        IF v_done THEN
+            LEAVE read_loop;
+        END IF;
+
+        SET v_clean = TRIM(REGEXP_REPLACE(UPPER(v_preferred_name), '[.,()"\'‐−–—/\\[\\]{}#@!?;:°ªº&~`^_+=|<>]', ' '));
+        SET v_clean = REGEXP_REPLACE(v_clean, '([^[:alpha:]])-', '\\1 ');
+        SET v_clean = REGEXP_REPLACE(v_clean, '-([^[:alpha:]])', ' \\1');
+        SET v_clean = REGEXP_REPLACE(v_clean, '^-', '');
+        SET v_clean = REGEXP_REPLACE(v_clean, '-$', '');
+        SET v_clean = TRIM(REGEXP_REPLACE(v_clean, '\\s+', ' '));
+        SET v_clean = TRIM(REGEXP_REPLACE(v_clean, '\\s+(NETO|NETA|SOBRINHO|SOBRINHA|BISNETO|BISNETA|TERCEIRO|TERCEIRA|SR|SRA|II|III|IV|V|VI|VII|VIII|IX|X)$', ''));
+
+        IF v_clean IS NULL OR v_clean = '' THEN
+            ITERATE read_loop;
+        END IF;
+
+        IF LOCATE(' ', v_clean) = 0 THEN
+            IF CHAR_LENGTH(v_clean) > 1 THEN
+                SET v_signature = v_clean;
+            ELSE
+                ITERATE read_loop;
+            END IF;
+        ELSE
+            SET v_particle = REGEXP_SUBSTR(v_clean, '\\b(VAN DER|VAN DEN|VAN DE|VON DER|VON DEM|DE LA|DE LOS|DE LAS|DE LO)\\s+[^\\s]+$');
+            
+            IF v_particle IS NULL OR v_particle = '' THEN
+                SET v_particle = REGEXP_SUBSTR(v_clean, '\\b(DO|DA|DOS|DAS|DE|DEL|DELA|DELLA|DELLE|DELLO|DEGLI|DI|DU|DES|VAN|VON|AL|EL|LA|LE|LES|LO|LOS|LAS|SAINT|SAINTE|SAN|SANTA|SANTO|MC|MAC|BEN|BIN|IBN|AB|AP|AUF|ZU|ZUM|ZUR|TER|TEN)\\s+[^\\s]+$');
+            END IF;
+
+            IF v_particle IS NOT NULL AND v_particle != '' THEN
+                SET v_last_name = v_particle;
+            ELSE
+                SET v_last_name = REGEXP_SUBSTR(v_clean, '[^\\s]+$');
+            END IF;
+
+            IF v_last_name IS NULL OR v_last_name = '' THEN
+                ITERATE read_loop;
+            END IF;
+
+            SET v_given_upper = TRIM(SUBSTRING(v_clean, 1, CHAR_LENGTH(v_clean) - CHAR_LENGTH(v_last_name)));
+
+            IF v_given_upper != '' AND v_given_upper IS NOT NULL THEN
+                SET v_initials = TRIM(REGEXP_REPLACE(v_given_upper, '\\b([[:alpha:]])[^\\s]*\\s*', '\\1 '));
+                SET v_signature = CONCAT(v_last_name, ' ', v_initials);
+            ELSE
+                SET v_signature = v_last_name;
+            END IF;
+        END IF;
+
+        IF v_signature IS NOT NULL AND TRIM(v_signature) != '' THEN
+            INSERT INTO tmp_signatures (person_id, signature_string) VALUES (v_id, TRIM(v_signature))
+            ON DUPLICATE KEY UPDATE signature_string = VALUES(signature_string);
+        END IF;
+
+    END LOOP;
+    CLOSE cur;
+
+    INSERT IGNORE INTO signatures (signature)
+    SELECT DISTINCT signature_string FROM tmp_signatures;
+
+    UPDATE persons p
+    JOIN tmp_signatures ts ON p.id = ts.person_id
+    JOIN signatures s ON s.signature = ts.signature_string
+    SET p.signature_id = s.id;
+
+    DROP TEMPORARY TABLE tmp_signatures;
+END $$
+
+-- ---- sp_repair_work_references_consistency ---------------------------------------------------------
+-- Phase 3 — reconcile RESOLVED rows missing cited_work_id.
+DROP PROCEDURE IF EXISTS `sp_repair_work_references_consistency`$$
+CREATE PROCEDURE `sp_repair_work_references_consistency`(IN p_apply TINYINT)
+BEGIN
+    DECLARE v_apply TINYINT DEFAULT 1;
+    DECLARE v_before_invalid BIGINT DEFAULT 0;
+    DECLARE v_exact_matches BIGINT DEFAULT 0;
+    DECLARE v_set_pending BIGINT DEFAULT 0;
+    DECLARE v_after_invalid BIGINT DEFAULT 0;
+
+    SET v_apply = IFNULL(p_apply, 1);
+
+    SELECT COUNT(*)
+      INTO v_before_invalid
+      FROM work_references wr
+     WHERE wr.status = 'RESOLVED'
+       AND wr.cited_work_id IS NULL;
+
+    SELECT COUNT(*)
+      INTO v_exact_matches
+      FROM work_references wr
+      JOIN publications p ON p.doi = wr.cited_doi
+     WHERE wr.status = 'RESOLVED'
+       AND wr.cited_work_id IS NULL;
+
+    IF v_apply = 1 THEN
+        UPDATE work_references wr
+        JOIN publications p
+          ON p.doi = wr.cited_doi
+        SET wr.cited_work_id = p.work_id,
+            wr.resolved_at = COALESCE(wr.resolved_at, NOW())
+        WHERE wr.status = 'RESOLVED'
+          AND wr.cited_work_id IS NULL;
+
+        UPDATE work_references wr
+        SET wr.status = 'PENDING',
+            wr.resolved_at = NULL
+        WHERE wr.status = 'RESOLVED'
+          AND wr.cited_work_id IS NULL;
+
+        SET v_set_pending = ROW_COUNT();
+    END IF;
+
+    SELECT COUNT(*)
+      INTO v_after_invalid
+      FROM work_references wr
+     WHERE wr.status = 'RESOLVED'
+       AND wr.cited_work_id IS NULL;
+
+    SELECT
+        v_apply AS apply_mode,
+        v_before_invalid AS invalid_before,
+        v_exact_matches AS exact_matches_available,
+        v_set_pending AS rows_set_to_pending,
+        v_after_invalid AS invalid_after;
+END $$
+
+-- ---- sp_resolve_all_pending_existing ---------------------------------------------------------
+-- Phase 3 — resolve PENDING refs whose DOI now exists.
+DROP PROCEDURE IF EXISTS `sp_resolve_all_pending_existing`$$
+CREATE PROCEDURE `sp_resolve_all_pending_existing`(IN p_batch_size INT)
+BEGIN
+    DECLARE v_rows_affected INT DEFAULT 1;
+    DECLARE v_total_resolved INT DEFAULT 0;
+
+    WHILE v_rows_affected > 0 DO
+        UPDATE work_references wr
+        JOIN (
+            SELECT wr_inner.id, p.work_id
+            FROM work_references wr_inner
+            JOIN publications p ON wr_inner.cited_doi = p.doi
+            WHERE wr_inner.status = 'PENDING'
+            LIMIT p_batch_size
+        ) batch ON wr.id = batch.id
+        SET 
+            wr.cited_work_id = batch.work_id,
+            wr.status = 'RESOLVED',
+            wr.resolved_at = CURRENT_TIMESTAMP;
+
+        SET v_rows_affected = ROW_COUNT();
+        SET v_total_resolved = v_total_resolved + v_rows_affected;
+    END WHILE;
+
+    SELECT CONCAT('Total de referências retroativas resolvidas: ', v_total_resolved) AS status;
+END $$
+
+-- ---- sp_resolve_pending_references ---------------------------------------------------------
+-- Phase 3 helper — single-DOI pending resolver.
+DROP PROCEDURE IF EXISTS `sp_resolve_pending_references`$$
+CREATE PROCEDURE `sp_resolve_pending_references`(IN p_limit INT)
+BEGIN
+    
+    
+    
+    UPDATE work_references wr
+    JOIN publications p ON wr.cited_doi = p.doi
+    SET 
+        wr.cited_work_id = p.work_id,
+        wr.status = 'RESOLVED',
+        wr.resolved_at = CURRENT_TIMESTAMP
+    WHERE 
+        wr.status = 'PENDING' 
+        AND wr.cited_doi IS NOT NULL
+        AND p.doi IS NOT NULL
+    LIMIT p_limit;
+
+END $$
+
+-- ---- sp_review_reference_consistency ---------------------------------------------------------
+-- Phase 3 — iterative revert/resolve until stable.
 DROP PROCEDURE IF EXISTS `sp_review_reference_consistency`$$
 CREATE PROCEDURE `sp_review_reference_consistency`(IN p_batch_size INT)
 BEGIN
     DECLARE v_rows_affected INT DEFAULT 1;
 
-    -- Pass 1: unresolved references (doi no longer exists) -> PENDING
+    
     WHILE v_rows_affected > 0 DO
         UPDATE work_references wr
         LEFT JOIN publications p ON wr.cited_doi = p.doi
@@ -83,7 +414,7 @@ BEGIN
 
     SET v_rows_affected = 1;
 
-    -- Pass 2: resolvable references -> RESOLVED
+    
     WHILE v_rows_affected > 0 DO
         UPDATE work_references wr
         INNER JOIN publications p ON wr.cited_doi = p.doi
@@ -102,558 +433,167 @@ BEGIN
     END WHILE;
 
     SELECT 'Reference consistency review completed.' AS execution_status;
-END ;;$$
+END $$
 
-
--- ===========================================================================
--- Called by: persons_full_process.sql
--- ===========================================================================
-
-DROP PROCEDURE IF EXISTS `sp_merge_persons_in_batches`$$
-CREATE PROCEDURE `sp_merge_persons_in_batches`()
+-- ---- sp_update_core_statistics ---------------------------------------------------------
+-- Phase 4 — rebuild aggregates on persons/organizations/venues.
+DROP PROCEDURE IF EXISTS `sp_update_core_statistics`$$
+CREATE PROCEDURE `sp_update_core_statistics`()
 BEGIN
-    DECLARE v_batch_size INT DEFAULT 1000;
-    DECLARE v_rows_affected INT;
-    DECLARE v_total_processed INT DEFAULT 0;
-    DECLARE v_continue BOOLEAN DEFAULT TRUE;
-
-    CREATE TEMPORARY TABLE IF NOT EXISTS temp_batch (
-        primary_person_id INT,
-        secondary_person_id INT,
-        PRIMARY KEY (secondary_person_id)
-    );
-
-    CREATE TEMPORARY TABLE IF NOT EXISTS temp_keys_to_transfer (
-        primary_person_id INT,
-        secondary_person_id INT,
-        orcid VARCHAR(20),
-        scopus_id VARCHAR(50),
-        lattes_id VARCHAR(20),
-        signature_id INT UNSIGNED,
-        PRIMARY KEY (secondary_person_id)
-    );
-
-    REPEAT
-        TRUNCATE TABLE temp_batch;
-        TRUNCATE TABLE temp_keys_to_transfer;
-
-        INSERT INTO temp_batch (primary_person_id, secondary_person_id)
-        SELECT primary_person_id, secondary_person_id
-        FROM temp_person_merge_pairs
-        LIMIT v_batch_size;
-
-        SET v_rows_affected = ROW_COUNT();
-        SET v_continue = (v_rows_affected > 0);
-        SET v_total_processed = v_total_processed + v_rows_affected;
-
-        IF v_continue THEN
-            START TRANSACTION;
-
-            INSERT INTO temp_keys_to_transfer (primary_person_id, secondary_person_id, orcid, scopus_id, lattes_id, signature_id)
-            SELECT
-                p_primary.id,
-                p_secondary.id,
-                CASE WHEN p_primary.orcid IS NULL THEN p_secondary.orcid ELSE NULL END,
-                CASE WHEN p_primary.scopus_id IS NULL THEN p_secondary.scopus_id ELSE NULL END,
-                CASE WHEN p_primary.lattes_id IS NULL THEN p_secondary.lattes_id ELSE NULL END,
-                CASE WHEN p_primary.signature_id IS NULL THEN p_secondary.signature_id ELSE NULL END
-            FROM persons p_primary
-            JOIN temp_batch t ON p_primary.id = t.primary_person_id
-            JOIN persons p_secondary ON p_secondary.id = t.secondary_person_id;
-
-            UPDATE persons p
-            JOIN temp_keys_to_transfer temp ON p.id = temp.secondary_person_id
-            SET p.orcid = NULL, p.scopus_id = NULL, p.lattes_id = NULL;
-
-            UPDATE persons p
-            JOIN temp_keys_to_transfer temp ON p.id = temp.primary_person_id
-            SET
-                p.orcid = COALESCE(p.orcid, temp.orcid),
-                p.scopus_id = COALESCE(p.scopus_id, temp.scopus_id),
-                p.lattes_id = COALESCE(p.lattes_id, temp.lattes_id),
-                p.signature_id = COALESCE(p.signature_id, temp.signature_id),
-                p.is_verified = GREATEST(p.is_verified, (SELECT is_verified FROM persons WHERE id = temp.secondary_person_id));
-
-            UPDATE IGNORE authorships a JOIN temp_batch t ON a.person_id = t.secondary_person_id SET a.person_id = t.primary_person_id;
-            UPDATE IGNORE course_instructors ci JOIN temp_batch t ON ci.person_id = t.secondary_person_id SET ci.person_id = t.primary_person_id;
-            UPDATE IGNORE course_instructors ci JOIN temp_batch t ON ci.canonical_person_id = t.secondary_person_id SET ci.canonical_person_id = t.primary_person_id;
-            UPDATE IGNORE person_match_log pml JOIN temp_batch t ON pml.matched_person_id = t.secondary_person_id SET pml.matched_person_id = t.primary_person_id;
-            UPDATE IGNORE work_author_summary was JOIN temp_batch t ON was.first_author_id = t.secondary_person_id SET was.first_author_id = t.primary_person_id;
-
-            DELETE FROM persons WHERE id IN (SELECT secondary_person_id FROM temp_batch);
-            DELETE FROM temp_person_merge_pairs WHERE secondary_person_id IN (SELECT secondary_person_id FROM temp_batch);
-
-            COMMIT;
-        END IF;
-
-    UNTIL NOT v_continue END REPEAT;
-
-    DROP TEMPORARY TABLE IF EXISTS temp_batch;
-    DROP TEMPORARY TABLE IF EXISTS temp_keys_to_transfer;
-    
-    SELECT CONCAT('Merge concluído. Total processado: ', v_total_processed) AS status;
-END ;;$$
-
-DROP PROCEDURE IF EXISTS `sp_generate_person_signatures`$$
-CREATE PROCEDURE `sp_generate_person_signatures`(
-    IN p_person_id      INT,
-    IN p_force_rebuild  TINYINT
-)
-BEGIN
-
-    DECLARE v_id             INT;
-    DECLARE v_preferred_name VARCHAR(255);
-    DECLARE v_clean          VARCHAR(500);
-    DECLARE v_last_name      VARCHAR(255);
-    DECLARE v_given_upper    VARCHAR(500);
-    DECLARE v_initials       VARCHAR(255);
-    DECLARE v_particle       VARCHAR(255);
-    DECLARE v_signature      VARCHAR(255);
-    DECLARE v_done           INT DEFAULT 0;
-    DECLARE v_rows_staged    INT DEFAULT 0;
-    DECLARE v_rows_linked    INT DEFAULT 0;
-    DECLARE v_started_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-
-    DECLARE cur CURSOR FOR
-        SELECT id, preferred_name
-        FROM persons
-        WHERE preferred_name IS NOT NULL
-          AND TRIM(preferred_name) != ''
-          AND (p_person_id IS NULL OR id = p_person_id)
-          AND (p_force_rebuild = 1 OR signature_id IS NULL);
-
-    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
-
-    DECLARE EXIT HANDLER FOR SQLEXCEPTION
-    BEGIN
-        ROLLBACK;
-        INSERT INTO processing_log (entity_type, entity_id, action, status, error_message, created_at)
-        VALUES ('PERSON', COALESCE(p_person_id, 0), 'sp_generate_person_signatures', 'FAILED',
-                CONCAT('Exception at ', NOW()), NOW());
-        RESIGNAL;
-    END;
-
-    TRUNCATE TABLE staging_person_signatures;
-
-    OPEN cur;
-
-    read_loop: LOOP
-        FETCH cur INTO v_id, v_preferred_name;
-        IF v_done THEN
-            LEAVE read_loop;
-        END IF;
-
-        SET v_clean     = NULL;
-        SET v_last_name = NULL;
-        SET v_particle  = NULL;
-        SET v_signature = NULL;
-
-        
-        SET v_clean = TRIM(REGEXP_REPLACE(
-            UPPER(v_preferred_name),
-            '[.,()"\'‐−–—/\\[\\]{}#@!?;:°ªº&~`^_+=|<>]',
-            ' '
-        ));
-        SET v_clean = REGEXP_REPLACE(v_clean, '([^[:alpha:]])-', '\\1 ');
-        SET v_clean = REGEXP_REPLACE(v_clean, '-([^[:alpha:]])', ' \\1');
-        SET v_clean = REGEXP_REPLACE(v_clean, '^-', '');
-        SET v_clean = REGEXP_REPLACE(v_clean, '-$', '');
-        SET v_clean = TRIM(REGEXP_REPLACE(v_clean, '\\s+', ' '));
-
-        
-        SET v_clean = TRIM(REGEXP_REPLACE(
-            v_clean,
-            '\\s+(NETO|NETA|SOBRINHO|SOBRINHA|BISNETO|BISNETA|TERCEIRO|TERCEIRA|SR|SRA|II|III|IV|V|VI|VII|VIII|IX|X)$',
-            ''
-        ));
-        SET v_clean = TRIM(REGEXP_REPLACE(
-            v_clean,
-            '\\s+(NETO|NETA|SOBRINHO|SOBRINHA|BISNETO|BISNETA|TERCEIRO|TERCEIRA|SR|SRA|II|III|IV|V|VI|VII|VIII|IX|X)$',
-            ''
-        ));
-
-        IF v_clean IS NULL OR v_clean = '' THEN
-            ITERATE read_loop;
-        END IF;
-
-        IF LOCATE(' ', v_clean) = 0 THEN
-            IF CHAR_LENGTH(v_clean) > 1 THEN
-                SET v_signature = v_clean;
-            ELSE
-                ITERATE read_loop;
-            END IF;
-        ELSE
-            
-            SET v_particle = NULL;
-
-            SET v_particle = REGEXP_SUBSTR(
-                v_clean,
-                '\\b(VAN DER|VAN DEN|VAN DE|VON DER|VON DEM|DE LA|DE LOS|DE LAS|DE LO)\\s+[^\\s]+$'
-            );
-
-            
-            IF v_particle IS NULL OR v_particle = '' THEN
-                SET v_particle = REGEXP_SUBSTR(
-                    v_clean,
-                    '\\b(DO|DA|DOS|DAS|DE|DEL|DELA|DELLA|DELLE|DELLO|DEGLI|DI|DU|DES|VAN|VON|AL|EL|LA|LE|LES|LO|LOS|LAS|SAINT|SAINTE|SAN|SANTA|SANTO|MC|MAC|BEN|BIN|IBN|AB|AP|AUF|ZU|ZUM|ZUR|TER|TEN)\\s+[^\\s]+$'
-                );
-            END IF;
-
-            IF v_particle IS NOT NULL AND v_particle != '' THEN
-                SET v_last_name = v_particle;
-            ELSE
-                SET v_last_name = REGEXP_SUBSTR(v_clean, '[^\\s]+$');
-            END IF;
-
-            IF v_last_name IS NULL OR v_last_name = '' THEN
-                ITERATE read_loop;
-            END IF;
-
-            
-            SET v_given_upper = TRIM(SUBSTRING(
-                v_clean, 1,
-                CHAR_LENGTH(v_clean) - CHAR_LENGTH(v_last_name)
-            ));
-
-            IF v_given_upper != '' AND v_given_upper IS NOT NULL THEN
-                SET v_initials = TRIM(REGEXP_REPLACE(
-                    v_given_upper,
-                    '\\b([[:alpha:]])[^\\s]*\\s*',
-                    '\\1 '
-                ));
-                SET v_signature = CONCAT(v_last_name, ' ', v_initials);
-            ELSE
-                SET v_signature = v_last_name;
-            END IF;
-        END IF;
-
-        IF v_signature IS NOT NULL AND TRIM(v_signature) != '' THEN
-            INSERT IGNORE INTO staging_person_signatures (person_id, signature_string)
-            VALUES (v_id, TRIM(v_signature));
-            SET v_rows_staged = v_rows_staged + ROW_COUNT();
-        END IF;
-
-    END LOOP;
-
-    CLOSE cur;
-
-    START TRANSACTION;
-
-    INSERT IGNORE INTO signatures (signature)
-    SELECT DISTINCT signature_string
-    FROM staging_person_signatures;
-
-    UPDATE persons p
-    INNER JOIN staging_person_signatures st ON st.person_id = p.id
-    INNER JOIN signatures s                 ON s.signature  = st.signature_string
-    SET p.signature_id = s.id;
-
-    SET v_rows_linked = ROW_COUNT();
-
-    COMMIT;
-
-    INSERT INTO processing_log (entity_type, entity_id, action, status, error_message, created_at)
-    VALUES (
-        'PERSON',
-        COALESCE(p_person_id, 0),
-        'sp_generate_person_signatures',
-        'SUCCESS',
-        CONCAT('staged=', v_rows_staged, ' linked=', v_rows_linked,
-               ' elapsed=', TIMESTAMPDIFF(SECOND, v_started_at, NOW()), 's'),
-        NOW()
-    );
-
-END ;;$$
-
-DROP PROCEDURE IF EXISTS `sp_fix_person_name_parts`$$
-CREATE PROCEDURE `sp_fix_person_name_parts`(
-    IN p_person_id   INT,
-    IN p_force       TINYINT
-)
-BEGIN
-
-    DECLARE v_id             INT;
-    DECLARE v_preferred_name VARCHAR(255);
-    DECLARE v_clean          VARCHAR(500);
-    DECLARE v_last_name      VARCHAR(255);
-    DECLARE v_particle       VARCHAR(255);
-    DECLARE v_new_family     VARCHAR(255);
-    DECLARE v_new_given      VARCHAR(255);
-    DECLARE v_pref_trimmed   VARCHAR(255);
-    DECLARE v_pref_upper     VARCHAR(255);
-    DECLARE v_family_pos     INT;
-    DECLARE v_done           INT DEFAULT 0;
-    DECLARE v_rows_updated   INT DEFAULT 0;
-    DECLARE v_started_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
-
-    DECLARE cur CURSOR FOR
-        SELECT id, preferred_name
-        FROM persons
-        WHERE preferred_name IS NOT NULL
-          AND TRIM(preferred_name) != ''
-          AND (p_person_id IS NULL OR id = p_person_id)
-          AND (
-              p_force = 1
-              OR family_name IS NULL
-              OR TRIM(COALESCE(family_name, '')) = ''
-          );
-
-    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = 1;
-
-    DECLARE EXIT HANDLER FOR SQLEXCEPTION
-    BEGIN
-        ROLLBACK;
-        INSERT INTO processing_log (entity_type, entity_id, action, status, error_message, created_at)
-        VALUES ('PERSON', COALESCE(p_person_id, 0), 'sp_fix_person_name_parts', 'FAILED',
-                CONCAT('Exception at ', NOW()), NOW());
-        RESIGNAL;
-    END;
-
-    OPEN cur;
-
-    read_loop: LOOP
-        FETCH cur INTO v_id, v_preferred_name;
-        IF v_done THEN
-            LEAVE read_loop;
-        END IF;
-
-        SET v_pref_trimmed = TRIM(v_preferred_name);
-        SET v_pref_upper   = UPPER(v_pref_trimmed);
-
-        
-        SET v_clean = TRIM(REGEXP_REPLACE(
-            v_pref_upper,
-            '[.,()"\'‐−–—/\\[\\]{}#@!?;:°ªº&~`^_+=|<>]',
-            ' '
-        ));
-        SET v_clean = REGEXP_REPLACE(v_clean, '([^[:alpha:]])-', '\\1 ');
-        SET v_clean = REGEXP_REPLACE(v_clean, '-([^[:alpha:]])', ' \\1');
-        SET v_clean = REGEXP_REPLACE(v_clean, '^-', '');
-        SET v_clean = REGEXP_REPLACE(v_clean, '-$', '');
-        SET v_clean = TRIM(REGEXP_REPLACE(v_clean, '\\s+', ' '));
-
-        
-        SET v_clean = TRIM(REGEXP_REPLACE(
-            v_clean,
-            '\\s+(NETO|NETA|SOBRINHO|SOBRINHA|BISNETO|BISNETA|TERCEIRO|TERCEIRA|SR|SRA|II|III|IV|V|VI|VII|VIII|IX|X)$',
-            ''
-        ));
-        SET v_clean = TRIM(REGEXP_REPLACE(
-            v_clean,
-            '\\s+(NETO|NETA|SOBRINHO|SOBRINHA|BISNETO|BISNETA|TERCEIRO|TERCEIRA|SR|SRA|II|III|IV|V|VI|VII|VIII|IX|X)$',
-            ''
-        ));
-
-        IF v_clean IS NULL OR v_clean = '' THEN
-            ITERATE read_loop;
-        END IF;
-
-        IF LOCATE(' ', v_clean) = 0 THEN
-            IF CHAR_LENGTH(v_clean) > 1 THEN
-                UPDATE persons
-                SET family_name = v_pref_trimmed,
-                    given_names = NULL
-                WHERE id = v_id;
-                SET v_rows_updated = v_rows_updated + ROW_COUNT();
-            END IF;
-            ITERATE read_loop;
-        END IF;
-
-        
-        SET v_particle = NULL;
-
-        SET v_particle = REGEXP_SUBSTR(
-            v_clean,
-            '\\b(VAN DER|VAN DEN|VAN DE|VON DER|VON DEM|DE LA|DE LOS|DE LAS|DE LO)\\s+[^\\s]+$'
-        );
-
-        
-        IF v_particle IS NULL OR v_particle = '' THEN
-            SET v_particle = REGEXP_SUBSTR(
-                v_clean,
-                '\\b(DO|DA|DOS|DAS|DE|DEL|DELA|DELLA|DELLE|DELLO|DEGLI|DI|DU|DES|VAN|VON|AL|EL|LA|LE|LES|LO|LOS|LAS|SAINT|SAINTE|SAN|SANTA|SANTO|MC|MAC|BEN|BIN|IBN|AB|AP|AUF|ZU|ZUM|ZUR|TER|TEN)\\s+[^\\s]+$'
-            );
-        END IF;
-
-        IF v_particle IS NOT NULL AND v_particle != '' THEN
-            SET v_last_name = v_particle;
-        ELSE
-            SET v_last_name = REGEXP_SUBSTR(v_clean, '[^\\s]+$');
-        END IF;
-
-        IF v_last_name IS NULL OR v_last_name = '' THEN
-            ITERATE read_loop;
-        END IF;
-
-        
-        SET v_family_pos = 0;
-
-        BEGIN
-            DECLARE v_search_from INT DEFAULT 1;
-            DECLARE v_found       INT DEFAULT 0;
-            DECLARE v_candidate   INT;
-
-            search_loop: LOOP
-                SET v_candidate = LOCATE(v_last_name, v_pref_upper, v_search_from);
-                IF v_candidate = 0 THEN
-                    LEAVE search_loop;
-                END IF;
-                IF v_candidate + CHAR_LENGTH(v_last_name) - 1 = CHAR_LENGTH(v_pref_upper) THEN
-                    IF v_candidate = 1 OR SUBSTRING(v_pref_upper, v_candidate - 1, 1) = ' ' THEN
-                        SET v_found = v_candidate;
-                    END IF;
-                END IF;
-                SET v_search_from = v_candidate + 1;
-                IF v_search_from > CHAR_LENGTH(v_pref_upper) THEN
-                    LEAVE search_loop;
-                END IF;
-            END LOOP;
-
-            SET v_family_pos = v_found;
-        END;
-
-        IF v_family_pos = 0 THEN
-            SET v_family_pos = CHAR_LENGTH(v_pref_trimmed) - CHAR_LENGTH(v_last_name) + 1;
-        END IF;
-
-        
-        SET v_new_family = TRIM(SUBSTRING(v_pref_trimmed, v_family_pos));
-
-        IF v_family_pos > 1 THEN
-            SET v_new_given = TRIM(SUBSTRING(v_pref_trimmed, 1, v_family_pos - 1));
-            IF v_new_given = '' THEN
-                SET v_new_given = NULL;
-            END IF;
-        ELSE
-            SET v_new_given = NULL;
-        END IF;
-
-        UPDATE persons
-        SET family_name = v_new_family,
-            given_names = v_new_given
-        WHERE id = v_id
-          AND (
-              COALESCE(family_name, '') != COALESCE(v_new_family, '')
-              OR COALESCE(given_names, '') != COALESCE(v_new_given, '')
-          );
-
-        SET v_rows_updated = v_rows_updated + ROW_COUNT();
-
-    END LOOP;
-
-    CLOSE cur;
-
-    INSERT INTO processing_log (entity_type, entity_id, action, status, error_message, created_at)
-    VALUES (
-        'PERSON',
-        COALESCE(p_person_id, 0),
-        'sp_fix_person_name_parts',
-        'SUCCESS',
-        CONCAT('updated=', v_rows_updated,
-               ' elapsed=', TIMESTAMPDIFF(SECOND, v_started_at, NOW()), 's'),
-        NOW()
-    );
-
-END ;;$$
-
-DROP PROCEDURE IF EXISTS `sp_run_full_recalculation`$$
-CREATE PROCEDURE `sp_run_full_recalculation`()
-BEGIN
-    
     SET FOREIGN_KEY_CHECKS = 0;
+    SET SESSION group_concat_max_len = 1000000;
 
     
-    UPDATE persons p
-    JOIN (
+    DROP TEMPORARY TABLE IF EXISTS tmp_person_stats;
+    CREATE TEMPORARY TABLE tmp_person_stats (
+        person_id INT PRIMARY KEY,
+        total_works INT DEFAULT 0,
+        total_citations INT DEFAULT 0,
+        corresponding_count INT DEFAULT 0,
+        first_year SMALLINT DEFAULT NULL,
+        last_year SMALLINT DEFAULT NULL,
+        h_index INT DEFAULT 0
+    ) ENGINE=InnoDB;
+
+    INSERT INTO tmp_person_stats (person_id, total_works, corresponding_count, first_year, last_year)
+    SELECT 
+        a.person_id,
+        COUNT(DISTINCT a.work_id),
+        SUM(CASE WHEN a.is_corresponding = 1 THEN 1 ELSE 0 END),
+        MIN(p.year),
+        MAX(p.year)
+    FROM authorships a
+    LEFT JOIN publications p ON a.work_id = p.work_id
+    GROUP BY a.person_id;
+
+    
+    DROP TEMPORARY TABLE IF EXISTS tmp_person_hindex;
+    CREATE TEMPORARY TABLE tmp_person_hindex (
+        person_id INT PRIMARY KEY,
+        total_citations INT DEFAULT 0,
+        h_index INT DEFAULT 0
+    ) ENGINE=InnoDB;
+
+    INSERT INTO tmp_person_hindex (person_id, total_citations, h_index)
+    SELECT 
+        person_id,
+        SUM(citations),
+        MAX(CASE WHEN citations >= rn THEN rn ELSE 0 END)
+    FROM (
         SELECT 
             a.person_id,
-            COUNT(DISTINCT a.work_id) as total_works,
-            SUM(w.citation_count) as total_citations,
-            SUM(CASE WHEN a.is_corresponding = 1 THEN 1 ELSE 0 END) as corresponding_count,
-            MIN(pub.year) as first_year,
-            MAX(pub.year) as last_year
+            w.citation_count AS citations,
+            ROW_NUMBER() OVER(PARTITION BY a.person_id ORDER BY w.citation_count DESC) as rn
         FROM authorships a
         JOIN works w ON a.work_id = w.id
-        LEFT JOIN publications pub ON a.work_id = pub.work_id
-        GROUP BY a.person_id
-    ) stats ON p.id = stats.person_id
-    SET 
-        p.total_works = COALESCE(stats.total_works, 0),
-        p.total_citations = COALESCE(stats.total_citations, 0),
-        p.corresponding_author_count = COALESCE(stats.corresponding_count, 0),
-        p.first_publication_year = stats.first_year,
-        p.latest_publication_year = stats.last_year;
+    ) ranked
+    GROUP BY person_id;
+
+    UPDATE tmp_person_stats t
+    JOIN tmp_person_hindex h ON t.person_id = h.person_id
+    SET t.total_citations = h.total_citations, t.h_index = h.h_index;
+
+    UPDATE persons p JOIN tmp_person_stats t ON p.id = t.person_id
+    SET p.total_works = t.total_works, p.total_citations = t.total_citations, 
+        p.corresponding_author_count = t.corresponding_count, p.first_publication_year = t.first_year, 
+        p.latest_publication_year = t.last_year, p.h_index = t.h_index;
 
     
-    UPDATE organizations o
-    JOIN (
-        SELECT 
-            a.affiliation_id,
-            COUNT(DISTINCT a.person_id) as researcher_count,
-            COUNT(DISTINCT a.work_id) as publication_count,
-            SUM(w.citation_count) as total_citations,
-            SUM(CASE WHEN p.open_access = 1 THEN 1 ELSE 0 END) as open_access_count
-        FROM authorships a
-        JOIN works w ON a.work_id = w.id
-        LEFT JOIN publications p ON a.work_id = p.work_id
-        GROUP BY a.affiliation_id
-    ) stats ON o.id = stats.affiliation_id
-    SET 
-        o.publication_count = COALESCE(stats.publication_count, 0),
-        o.researcher_count = COALESCE(stats.researcher_count, 0),
-        o.total_citations = COALESCE(stats.total_citations, 0),
-        o.open_access_works_count = COALESCE(stats.open_access_count, 0);
+    DROP TEMPORARY TABLE IF EXISTS tmp_org_stats;
+    CREATE TEMPORARY TABLE tmp_org_stats (
+        affiliation_id INT PRIMARY KEY,
+        researcher_count INT DEFAULT 0,
+        publication_count INT DEFAULT 0,
+        total_citations INT DEFAULT 0,
+        open_access_count INT DEFAULT 0
+    ) ENGINE=InnoDB;
+
+    INSERT INTO tmp_org_stats (affiliation_id, researcher_count, publication_count, total_citations, open_access_count)
+    SELECT 
+        a.affiliation_id,
+        COUNT(DISTINCT a.person_id),
+        COUNT(DISTINCT a.work_id),
+        SUM(w.citation_count),
+        SUM(CASE WHEN pub.open_access = 1 THEN 1 ELSE 0 END)
+    FROM authorships a
+    JOIN works w ON a.work_id = w.id
+    LEFT JOIN publications pub ON a.work_id = pub.work_id
+    WHERE a.affiliation_id IS NOT NULL
+    GROUP BY a.affiliation_id;
+
+    UPDATE organizations o JOIN tmp_org_stats t ON o.id = t.affiliation_id
+    SET o.publication_count = t.publication_count, o.researcher_count = t.researcher_count, 
+        o.total_citations = t.total_citations, o.open_access_works_count = t.open_access_count;
 
     
-    UPDATE venues v
-    JOIN (
-        SELECT 
-            p.venue_id,
-            COUNT(DISTINCT w.id) as works_count,
-            SUM(w.citation_count) as cited_by_count,
-            MIN(p.year) as start_year,
-            MAX(p.year) as end_year
-        FROM works w
-        JOIN publications p ON w.id = p.work_id
-        WHERE p.venue_id IS NOT NULL
-        GROUP BY p.venue_id
-    ) stats ON v.id = stats.venue_id
-    SET 
-        v.works_count = COALESCE(stats.works_count, 0),
-        v.cited_by_count = COALESCE(stats.cited_by_count, 0),
-        v.coverage_start_year = stats.start_year,
-        v.coverage_end_year = stats.end_year;
+    DROP TEMPORARY TABLE IF EXISTS tmp_venue_stats;
+    CREATE TEMPORARY TABLE tmp_venue_stats (
+        venue_id INT PRIMARY KEY,
+        works_count INT DEFAULT 0,
+        cited_by_count INT DEFAULT 0,
+        start_year SMALLINT DEFAULT NULL,
+        end_year SMALLINT DEFAULT NULL
+    ) ENGINE=InnoDB;
 
+    INSERT INTO tmp_venue_stats (venue_id, works_count, cited_by_count, start_year, end_year)
+    SELECT 
+        pub.venue_id,
+        COUNT(DISTINCT w.id),
+        SUM(w.citation_count),
+        MIN(pub.year),
+        MAX(pub.year)
+    FROM works w
+    JOIN publications pub ON w.id = pub.work_id
+    WHERE pub.venue_id IS NOT NULL
+    GROUP BY pub.venue_id;
+
+    UPDATE venues v JOIN tmp_venue_stats t ON v.id = t.venue_id
+    SET v.works_count = t.works_count, v.cited_by_count = t.cited_by_count, 
+        v.coverage_start_year = t.start_year, v.coverage_end_year = t.end_year;
+
+    
+    DROP TEMPORARY TABLE tmp_person_stats;
+    DROP TEMPORARY TABLE tmp_person_hindex;
+    DROP TEMPORARY TABLE tmp_org_stats;
+    DROP TEMPORARY TABLE tmp_venue_stats;
     SET FOREIGN_KEY_CHECKS = 1;
-END ;;$$
+END $$
 
-
--- ===========================================================================
--- Called by: metrics.py
--- ===========================================================================
-
-DROP PROCEDURE IF EXISTS `sp_update_persons_summary`$$
-CREATE PROCEDURE `sp_update_persons_summary`()
+-- ---- fn_calculate_10yr_impact_factor ---------------------------------------------------------
+-- Phase 5 helper — 10-year impact factor for one venue.
+DROP FUNCTION IF EXISTS `fn_calculate_10yr_impact_factor`$$
+CREATE FUNCTION `fn_calculate_10yr_impact_factor`(p_venue_id INT, p_target_year INT) RETURNS decimal(10,3)
+    READS SQL DATA
+    DETERMINISTIC
 BEGIN
-    INSERT INTO sphinx_persons_summary 
-        (id, search_content, preferred_name, is_verified, total_works, latest_publication_year)
-    SELECT
-        p.id,
-        CONCAT_WS(' ', p.preferred_name, s.signature) AS search_content,
-        p.preferred_name,
-        p.is_verified,
-        p.total_works,
-        p.latest_publication_year
-    FROM persons p
-    LEFT JOIN signatures s ON p.signature_id = s.id
-    ON DUPLICATE KEY UPDATE
-        search_content = VALUES(search_content),
-        preferred_name = VALUES(preferred_name),
-        is_verified = VALUES(is_verified),
-        total_works = VALUES(total_works),
-        latest_publication_year = VALUES(latest_publication_year);
-END ;;$$
+    DECLARE v_numerator INT DEFAULT 0;
+    DECLARE v_denominator INT DEFAULT 0;
+    DECLARE v_result DECIMAL(10,3) DEFAULT 0.000;
 
+    SELECT COUNT(*) INTO v_denominator
+    FROM publications p
+    JOIN works w ON p.work_id = w.id
+    WHERE p.venue_id = p_venue_id
+      AND p.year BETWEEN (p_target_year - 10) AND (p_target_year - 1)
+      AND w.work_type IN ('ARTICLE', 'CONFERENCE', 'CHAPTER', 'BOOK');
+
+    IF v_denominator = 0 THEN RETURN 0.000; END IF;
+
+    SELECT COUNT(*) INTO v_numerator
+    FROM work_references wr
+    JOIN publications citing_pub ON wr.citing_work_id = citing_pub.work_id 
+    JOIN publications cited_pub ON wr.cited_work_id = cited_pub.work_id    
+    WHERE cited_pub.venue_id = p_venue_id
+      AND wr.status = 'RESOLVED'
+      AND citing_pub.year = p_target_year 
+      AND cited_pub.year BETWEEN (p_target_year - 10) AND (p_target_year - 1);
+
+    SET v_result = v_numerator / v_denominator;
+    RETURN v_result;
+END $$
+
+-- ---- sp_update_10yr_impact_factors ---------------------------------------------------------
+-- Phase 5 — bulk impact_factor update via fn above.
 DROP PROCEDURE IF EXISTS `sp_update_10yr_impact_factors`$$
 CREATE PROCEDURE `sp_update_10yr_impact_factors`()
 BEGIN
@@ -680,174 +620,320 @@ BEGIN
         ROW_COUNT() as venues_updated, 
         v_reference_year as calculation_year,
         'Success (10-year window)' as status;
-END ;;$$
+END $$
 
-DROP PROCEDURE IF EXISTS `sp_populate_sphinx_venues_summary`$$
-CREATE PROCEDURE `sp_populate_sphinx_venues_summary`()
+-- ---- sp_orchestrate_all_summaries ---------------------------------------------------------
+-- Phase 6 — alt single-entry summary rebuild.
+DROP PROCEDURE IF EXISTS `sp_orchestrate_all_summaries`$$
+CREATE PROCEDURE `sp_orchestrate_all_summaries`(IN p_batch_size INT)
 BEGIN
-    SET SESSION group_concat_max_len = 1000000;
-    TRUNCATE TABLE `sphinx_venues_summary`;
+    CALL sp_build_summary_publications(p_batch_size);
+    CALL sp_build_summary_venues();
+    CALL sp_build_summary_persons(p_batch_size);
+END $$
 
-    CREATE TEMPORARY TABLE tmp_venue_oa
-    SELECT venue_id, (SUM(open_access=1)*100.0/COUNT(*)) as oa_avg
-    FROM publications 
-    WHERE venue_id IS NOT NULL
-    GROUP BY venue_id;
-
-    CREATE TEMPORARY TABLE tmp_venue_subjects
-    SELECT venue_id, GROUP_CONCAT(term ORDER BY score DESC SEPARATOR '; ') as subjects_str
-    FROM (
-        SELECT vs.venue_id, s.term, vs.score,
-               ROW_NUMBER() OVER(PARTITION BY vs.venue_id ORDER BY vs.score DESC) as rn
-        FROM venue_subjects vs
-        JOIN subjects s ON vs.subject_id = s.id
-    ) ranked
-    WHERE rn <= 20
-    GROUP BY venue_id;
-
-    CREATE TEMPORARY TABLE tmp_venue_works
-    SELECT venue_id, GROUP_CONCAT(title ORDER BY citation_count DESC SEPARATOR '"; "') as works_str
-    FROM (
-        SELECT p.venue_id, w.title, w.citation_count,
-               ROW_NUMBER() OVER(PARTITION BY p.venue_id ORDER BY w.citation_count DESC) as rn
-        FROM publications p
-        JOIN works w ON p.work_id = w.id
-        WHERE p.venue_id IS NOT NULL
-    ) ranked
-    WHERE rn <= 5
-    GROUP BY venue_id;
-
-    ALTER TABLE tmp_venue_oa ADD PRIMARY KEY (venue_id);
-    ALTER TABLE tmp_venue_subjects ADD PRIMARY KEY (venue_id);
-    ALTER TABLE tmp_venue_works ADD PRIMARY KEY (venue_id);
-
-    INSERT INTO `sphinx_venues_summary` (
-        id, name, abbreviated_name, type, publisher_name, country_code, issn, eissn, 
-        subjects_string, top_works_string, works_count, cited_by_count, 
-        impact_factor, h_index, open_access_percentage
-    )
-    SELECT
-        v.id, v.name, v.abbreviated_name, v.type, o.name, v.country_code, v.issn, v.eissn,
-        vsa.subjects_str, vwa.works_str, 
-        COALESCE(v.works_count, 0), COALESCE(v.cited_by_count, 0),
-        v.impact_factor, v.h_index, COALESCE(voa.oa_avg, 0.00)
-    FROM venues v
-    LEFT JOIN organizations o ON v.publisher_id = o.id
-    LEFT JOIN tmp_venue_oa voa ON v.id = voa.venue_id
-    LEFT JOIN tmp_venue_subjects vsa ON v.id = vsa.venue_id
-    LEFT JOIN tmp_venue_works vwa ON v.id = vwa.venue_id;
-
-    DROP TEMPORARY TABLE IF EXISTS tmp_venue_oa;
-    DROP TEMPORARY TABLE IF EXISTS tmp_venue_subjects;
-    DROP TEMPORARY TABLE IF EXISTS tmp_venue_works;
-END ;;$$
-
-DROP PROCEDURE IF EXISTS `sp_update_work_author_summary_all`$$
-CREATE PROCEDURE `sp_update_work_author_summary_all`()
+-- ---- sp_reindex_database ---------------------------------------------------------
+-- Phase 7 — refresh InnoDB table statistics.
+DROP PROCEDURE IF EXISTS `sp_reindex_database`$$
+CREATE PROCEDURE `sp_reindex_database`()
 BEGIN
-    SET SESSION group_concat_max_len = 1000000;
     
-    TRUNCATE TABLE work_author_summary;
+    SET FOREIGN_KEY_CHECKS = 0;
     
-    INSERT INTO work_author_summary (work_id, author_string, first_author_id)
+    
+    ANALYZE TABLE works;
+    ANALYZE TABLE persons;
+    ANALYZE TABLE organizations;
+    ANALYZE TABLE publications;
+    ANALYZE TABLE authorships;
+    
+    
+    SET FOREIGN_KEY_CHECKS = 1;
+    
+    SELECT 'Reindexação concluída' AS status;
+END $$
+
+-- ---- sp_disable_all_triggers ---------------------------------------------------------
+-- Maintenance — disable data triggers for bulk repairs.
+DROP PROCEDURE IF EXISTS `sp_disable_all_triggers`$$
+CREATE PROCEDURE `sp_disable_all_triggers`()
+BEGIN
+    CREATE TEMPORARY TABLE IF NOT EXISTS temp_trigger_definitions (
+        trigger_name VARCHAR(64),
+        event_manipulation VARCHAR(6),
+        event_object_table VARCHAR(64),
+        action_timing VARCHAR(6),
+        sql_mode TEXT,
+        definer TEXT,
+        action_statement LONGTEXT
+    );
+    TRUNCATE TABLE temp_trigger_definitions;
+
+    INSERT INTO temp_trigger_definitions
     SELECT 
-        a.work_id,
-        GROUP_CONCAT(p.preferred_name ORDER BY a.position ASC SEPARATOR '; '),
-        CAST(SUBSTRING_INDEX(GROUP_CONCAT(a.person_id ORDER BY a.position ASC), ',', 1) AS UNSIGNED)
-    FROM authorships a
-    JOIN persons p ON a.person_id = p.id
-    WHERE a.role = 'AUTHOR'
-    GROUP BY a.work_id;
-END ;;$$
+        TRIGGER_NAME, EVENT_MANIPULATION, EVENT_OBJECT_TABLE,
+        ACTION_TIMING, SQL_MODE, DEFINER, ACTION_STATEMENT
+    FROM information_schema.TRIGGERS
+    WHERE TRIGGER_SCHEMA = DATABASE();
 
-DROP PROCEDURE IF EXISTS `sp_update_work_subjects_summary_all`$$
-CREATE PROCEDURE `sp_update_work_subjects_summary_all`()
+    BLOCK1: BEGIN
+        DECLARE done INT DEFAULT FALSE;
+        DECLARE v_trigger_name VARCHAR(64);
+        DECLARE cur CURSOR FOR SELECT trigger_name FROM temp_trigger_definitions;
+        DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+        OPEN cur;
+        read_loop: LOOP
+            FETCH cur INTO v_trigger_name;
+            IF done THEN LEAVE read_loop; END IF;
+            SET @drop_sql = CONCAT('DROP TRIGGER IF EXISTS `', v_trigger_name, '`');
+            PREPARE stmt FROM @drop_sql;
+            EXECUTE stmt;
+            DEALLOCATE PREPARE stmt;
+        END LOOP;
+        CLOSE cur;
+    END BLOCK1;
+    
+END $$
+
+-- ---- sp_enable_all_triggers ---------------------------------------------------------
+-- Maintenance — re-enable data triggers after bulk repairs.
+DROP PROCEDURE IF EXISTS `sp_enable_all_triggers`$$
+CREATE PROCEDURE `sp_enable_all_triggers`()
 BEGIN
-    TRUNCATE TABLE work_subjects_summary;
+    BLOCK2: BEGIN
+        DECLARE done INT DEFAULT FALSE;
+        DECLARE v_trigger_name, v_event, v_table_name, v_timing, v_definer, v_sql_mode TEXT;
+        DECLARE v_action LONGTEXT;
+        DECLARE cur CURSOR FOR SELECT trigger_name, event_manipulation, event_object_table, action_timing, definer, sql_mode, action_statement FROM temp_trigger_definitions;
+        DECLARE CONTINUE HANDLER FOR NOT FOUND SET done = TRUE;
+        OPEN cur;
+        read_loop: LOOP
+            FETCH cur INTO v_trigger_name, v_event, v_table_name, v_timing, v_definer, v_sql_mode, v_action;
+            IF done THEN LEAVE read_loop; END IF;
+            SET @create_sql = CONCAT(
+                'CREATE DEFINER=', v_definer,
+                ' TRIGGER `', v_trigger_name, '` ',
+                v_timing, ' ', v_event,
+                ' ON `', v_table_name, '` FOR EACH ROW ',
+                v_action
+            );
+            PREPARE stmt FROM @create_sql;
+            EXECUTE stmt;
+            DEALLOCATE PREPARE stmt;
+        END LOOP;
+        CLOSE cur;
+    END BLOCK2;
+    DROP TEMPORARY TABLE IF EXISTS temp_trigger_definitions;
+    
+END $$
 
-    INSERT INTO work_subjects_summary (work_id, subjects_string)
-    SELECT
-        ws.work_id,
-        GROUP_CONCAT(s.term ORDER BY s.term SEPARATOR '; ')
-    FROM
-        work_subjects ws
-    JOIN
-        subjects s ON ws.subject_id = s.id
-    INNER JOIN 
-        works w ON ws.work_id = w.id
-    GROUP BY
-        ws.work_id;
-END ;;$$
-
-DROP PROCEDURE IF EXISTS `sp_update_works_summary`$$
-CREATE PROCEDURE `sp_update_works_summary`()
+-- ---- sp_merge_single_organization_pair ---------------------------------------------------------
+-- Maintenance — merge two organization rows.
+DROP PROCEDURE IF EXISTS `sp_merge_single_organization_pair`$$
+CREATE PROCEDURE `sp_merge_single_organization_pair`(
+    IN p_primary_org_id INT,    
+    IN p_secondary_org_id INT   
+)
 BEGIN
-    INSERT INTO sphinx_works_summary (
-        id, title, subtitle, abstract, author_string, venue_name, venue_abbrev,
-        first_author_name, publisher_name, doi, publication_id, venue_id, publisher_id,
-        first_author_id, author_count, institutions_count, citation_count, reference_count,
-        resolved_references_count, pending_references_count, cited_by_count,
-        has_pending_references, has_files, created_ts, `year`, work_type, `language`,
-        open_access, peer_reviewed, subjects_string
-    )
-    WITH LatestPublication AS (
-        SELECT
-            p.id as publication_id, p.work_id, p.doi, p.`year`, p.open_access, p.peer_reviewed, p.venue_id, p.publisher_id,
-            ROW_NUMBER() OVER(PARTITION BY p.work_id ORDER BY p.`year` DESC, p.id DESC) as rn
-        FROM publications p
-    ),
-    AuthorStats AS (
-        SELECT
-            a.work_id,
-            COUNT(DISTINCT a.person_id) as author_count,
-            COUNT(DISTINCT a.affiliation_id) as institutions_count
-        FROM authorships a
-        WHERE a.role = 'AUTHOR'
-        GROUP BY a.work_id
-    ),
-    ReferenceStats AS (
-        SELECT
-            citing_work_id,
-            COUNT(*) as reference_count,
-            SUM(CASE WHEN status = 'RESOLVED' THEN 1 ELSE 0 END) as resolved_references_count,
-            SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) as pending_references_count,
-            MAX(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END) as has_pending_references
-        FROM work_references
-        GROUP BY citing_work_id
-    ),
-    FileStats AS (
-        SELECT work_id, MAX(1) as has_files
-        FROM files
-        GROUP BY work_id
-    )
-    SELECT
-        w.id, w.title, w.subtitle, w.abstract, was.author_string, v.name AS venue_name, v.abbreviated_name AS venue_abbrev,
-        p_first.preferred_name AS first_author_name, org.name AS publisher_name, lp.doi, lp.publication_id, lp.venue_id, lp.publisher_id,
-        was.first_author_id, COALESCE(ast.author_count, 0), COALESCE(ast.institutions_count, 0), w.citation_count, COALESCE(rs.reference_count, 0),
-        COALESCE(rs.resolved_references_count, 0), COALESCE(rs.pending_references_count, 0), w.citation_count AS cited_by_count,
-        COALESCE(rs.has_pending_references, 0), COALESCE(fs.has_files, 0), UNIX_TIMESTAMP(w.created_at) AS created_ts, lp.`year`, w.work_type, w.language,
-        lp.open_access, lp.peer_reviewed, wss.subjects_string
-    FROM works w
-    LEFT JOIN work_author_summary was ON was.work_id = w.id
-    LEFT JOIN persons p_first ON p_first.id = was.first_author_id
-    LEFT JOIN LatestPublication lp ON lp.work_id = w.id AND lp.rn = 1
-    LEFT JOIN venues v ON v.id = lp.venue_id
-    LEFT JOIN organizations org ON org.id = lp.publisher_id
-    LEFT JOIN AuthorStats ast ON ast.work_id = w.id
-    LEFT JOIN ReferenceStats rs ON rs.citing_work_id = w.id
-    LEFT JOIN FileStats fs ON fs.work_id = w.id
-    LEFT JOIN work_subjects_summary wss ON wss.work_id = w.id
-    ON DUPLICATE KEY UPDATE
-        title = VALUES(title), subtitle = VALUES(subtitle), abstract = VALUES(abstract), author_string = VALUES(author_string),
-        venue_name = VALUES(venue_name), venue_abbrev = VALUES(venue_abbrev), first_author_name = VALUES(first_author_name),
-        publisher_name = VALUES(publisher_name), doi = VALUES(doi), publication_id = VALUES(publication_id), venue_id = VALUES(venue_id),
-        publisher_id = VALUES(publisher_id), first_author_id = VALUES(first_author_id), author_count = VALUES(author_count),
-        institutions_count = VALUES(institutions_count), citation_count = VALUES(citation_count), reference_count = VALUES(reference_count),
-        resolved_references_count = VALUES(resolved_references_count), pending_references_count = VALUES(pending_references_count),
-        cited_by_count = VALUES(cited_by_count), has_pending_references = VALUES(has_pending_references), has_files = VALUES(has_files),
-        `year` = VALUES(`year`), work_type = VALUES(work_type), `language` = VALUES(`language`), open_access = VALUES(open_access),
-        peer_reviewed = VALUES(peer_reviewed), subjects_string = VALUES(subjects_string);
-END ;;$$
+    
+    DECLARE v_primary_exists INT DEFAULT 0;
+    DECLARE v_secondary_exists INT DEFAULT 0;
 
+    
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        
+        RESIGNAL;
+    END;
+
+    
+    IF p_primary_org_id IS NULL OR p_secondary_org_id IS NULL THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Both primary and secondary IDs must be provided.';
+    END IF;
+
+    IF p_primary_org_id = p_secondary_org_id THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Primary and secondary IDs cannot be the same.';
+    END IF;
+
+    
+    SELECT COUNT(*) INTO v_primary_exists FROM organizations WHERE id = p_primary_org_id;
+    SELECT COUNT(*) INTO v_secondary_exists FROM organizations WHERE id = p_secondary_org_id;
+
+    IF v_primary_exists = 0 OR v_secondary_exists = 0 THEN
+        SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'One or both organization IDs do not exist.';
+    END IF;
+
+    
+    START TRANSACTION;
+
+    
+    UPDATE organizations o_primary
+    JOIN organizations o_secondary ON o_secondary.id = p_secondary_org_id
+    SET
+        o_primary.ror_id = COALESCE(o_primary.ror_id, o_secondary.ror_id),
+        o_primary.wikidata_id = COALESCE(o_primary.wikidata_id, o_secondary.wikidata_id),
+        o_primary.openalex_id = COALESCE(o_primary.openalex_id, o_secondary.openalex_id),
+        o_primary.mag_id = COALESCE(o_primary.mag_id, o_secondary.mag_id),
+        o_primary.url = COALESCE(o_primary.url, o_secondary.url),
+        o_primary.updated_at = NOW()
+    WHERE o_primary.id = p_primary_org_id;
+
+    
+    UPDATE IGNORE authorships SET affiliation_id = p_primary_org_id WHERE affiliation_id = p_secondary_org_id;
+    UPDATE IGNORE funding SET funder_id = p_primary_org_id WHERE funder_id = p_secondary_org_id;
+    UPDATE IGNORE programs SET institution_id = p_primary_org_id WHERE institution_id = p_secondary_org_id;
+    UPDATE IGNORE publications SET publisher_id = p_primary_org_id WHERE publisher_id = p_secondary_org_id;
+    UPDATE IGNORE venues SET publisher_id = p_primary_org_id WHERE publisher_id = p_secondary_org_id;
+
+    
+    DELETE FROM organizations WHERE id = p_secondary_org_id;
+
+    COMMIT;
+
+    
+    SELECT CONCAT('Successfully merged organization ID ', p_secondary_org_id, ' into ID ', p_primary_org_id) as Result;
+
+END $$
+
+-- ---- sp_fix_merged_work ---------------------------------------------------------
+-- Maintenance — repair authorships/refs after a work merge.
+DROP PROCEDURE IF EXISTS `sp_fix_merged_work`$$
+CREATE PROCEDURE `sp_fix_merged_work`(IN p_work_id INT)
+BEGIN
+    DECLARE v_publication_id_to_move INT;
+    DECLARE v_first_publication_id INT;
+    DECLARE v_new_work_id INT;
+    DECLARE v_unmerged_count INT DEFAULT 0;
+    DECLARE v_done INT DEFAULT FALSE;
+
+    DECLARE cur_publications_to_move CURSOR FOR
+        SELECT id
+        FROM publications
+        WHERE work_id = p_work_id AND id != v_first_publication_id;
+
+    DECLARE CONTINUE HANDLER FOR NOT FOUND SET v_done = TRUE;
+
+    START TRANSACTION;
+
+    SELECT MIN(id) INTO v_first_publication_id
+    FROM publications
+    WHERE work_id = p_work_id;
+
+    OPEN cur_publications_to_move;
+
+    move_loop: LOOP
+        FETCH cur_publications_to_move INTO v_publication_id_to_move;
+        IF v_done THEN
+            LEAVE move_loop;
+        END IF;
+
+        
+        INSERT INTO works (title, subtitle, abstract, work_type, language, reference_count)
+        SELECT title, subtitle, abstract, work_type, language, reference_count
+        FROM works WHERE id = p_work_id;
+
+        SET v_new_work_id = LAST_INSERT_ID();
+
+        
+        UPDATE publications SET work_id = v_new_work_id WHERE id = v_publication_id_to_move;
+        UPDATE files SET work_id = v_new_work_id WHERE publication_id = v_publication_id_to_move;
+
+        
+        INSERT INTO authorships (work_id, person_id, affiliation_id, role, `position`, is_corresponding)
+        SELECT v_new_work_id, person_id, affiliation_id, role, `position`, is_corresponding
+        FROM authorships
+        WHERE work_id = p_work_id;
+
+        INSERT INTO funding (work_id, funder_id, grant_number, program_name, amount, currency)
+        SELECT v_new_work_id, funder_id, grant_number, program_name, amount, currency
+        FROM funding
+        WHERE work_id = p_work_id;
+
+        INSERT INTO work_subjects (work_id, subject_id, relevance_score, assigned_by)
+        SELECT v_new_work_id, subject_id, relevance_score, assigned_by
+        FROM work_subjects
+        WHERE work_id = p_work_id;
+
+        INSERT INTO course_bibliography (course_id, work_id, reading_type, week_number, notes)
+        SELECT course_id, v_new_work_id, reading_type, week_number, notes
+        FROM course_bibliography
+        WHERE work_id = p_work_id;
+
+        SET v_unmerged_count = v_unmerged_count + 1;
+
+    END LOOP move_loop;
+    CLOSE cur_publications_to_move;
+
+    COMMIT;
+    
+    IF v_unmerged_count > 0 THEN
+       SELECT CONCAT('Sucesso para work_id ', p_work_id, ': ', v_unmerged_count, ' publicações desmembradas com relacionamentos duplicados por segurança.') AS status;
+    END IF;
+
+END $$
+
+-- ---- sp_fix_family_name ---------------------------------------------------------
+-- Maintenance — rewrite family_name across persons/authorships.
+DROP PROCEDURE IF EXISTS `sp_fix_family_name`$$
+CREATE PROCEDURE `sp_fix_family_name`(
+    IN p_wrong  VARCHAR(255),
+    IN p_right  VARCHAR(255)
+)
+BEGIN
+    DECLARE v_affected INT DEFAULT 0;
+
+    
+    UPDATE IGNORE persons
+    SET family_name = p_right
+    WHERE family_name = p_wrong;
+    SET v_affected = ROW_COUNT();
+
+    
+    UPDATE IGNORE persons
+    SET preferred_name = CONCAT(LEFT(preferred_name, CHAR_LENGTH(preferred_name) - CHAR_LENGTH(p_wrong)), p_right)
+    WHERE preferred_name LIKE CONCAT('% ', p_wrong)
+      AND family_name = p_right;
+
+    SELECT CONCAT(p_wrong, ' → ', p_right, ': ', v_affected, ' family_name(s) corrigido(s), ', ROW_COUNT(), ' preferred_name(s) corrigido(s)') AS resultado;
+END $$
+
+-- ---- sp_fix_family_given_names ---------------------------------------------------------
+-- Maintenance — patch split family/given names in batches.
+DROP PROCEDURE IF EXISTS `sp_fix_family_given_names`$$
+CREATE PROCEDURE `sp_fix_family_given_names`(IN p_batch_size INT)
+BEGIN
+    DECLARE v_max_id INT;
+    DECLARE v_offset INT DEFAULT 0;
+
+    SELECT MAX(id) INTO v_max_id FROM persons;
+
+    WHILE v_offset <= v_max_id DO
+        UPDATE persons 
+        SET 
+            
+            family_name = CASE 
+                WHEN LOCATE(' ', TRIM(preferred_name)) > 0 THEN
+                    REGEXP_SUBSTR(TRIM(preferred_name), '(?i)(\\b(do|da|dos|das|de|del|della|di|du|van der|van|von der|von|al|el|la|le|saint|sainte|mc|mac|o)\\s+)*[^\\s]+(\\s+(filho|junior|neto|sobrinho|jr|sr|iii|iv|v))?$')
+                ELSE 
+                    TRIM(preferred_name)
+            END,
+            
+            given_names = CASE 
+                WHEN LOCATE(' ', TRIM(preferred_name)) > 0 THEN
+                    NULLIF(TRIM(SUBSTRING(TRIM(preferred_name), 1, 
+                        LENGTH(TRIM(preferred_name)) - LENGTH(
+                            REGEXP_SUBSTR(TRIM(preferred_name), '(?i)(\\b(do|da|dos|das|de|del|della|di|du|van der|van|von der|von|al|el|la|le|saint|sainte|mc|mac|o)\\s+)*[^\\s]+(\\s+(filho|junior|neto|sobrinho|jr|sr|iii|iv|v))?$')
+                        )
+                    )), '')
+                ELSE 
+                    NULL
+            END
+        WHERE id BETWEEN v_offset AND v_offset + p_batch_size
+          AND preferred_name IS NOT NULL;
+        
+        SET v_offset = v_offset + p_batch_size + 1;
+    END WHILE;
+END $$
 
 DELIMITER ;
