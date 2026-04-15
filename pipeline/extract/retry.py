@@ -10,7 +10,7 @@ from pipeline.extract.config import get_config
 
 logger = logging.getLogger(__name__)
 
-MAX_RETRIES = 2
+MAX_RETRIES = 4
 
 # Global rate-limit gate: when any thread gets a 429, all threads pause.
 _rate_limit_lock = threading.Lock()

@@ -128,16 +128,6 @@ def normalize_venue_type(raw_type: Optional[str]) -> str:
     return VENUE_TYPE_MAP.get(raw_type.strip().lower(), VENUE_TYPE_OTHER)
 
 
-def parse_coverage_years(coverage: str) -> Tuple[Optional[int], Optional[int]]:
-    """Extract start and end year from SCImago coverage string like '1973-2025' or '1977-1978, 1984, 1996-2025'."""
-    if not coverage:
-        return None, None
-    years = [int(y) for y in re.findall(r"\b(1[89]\d{2}|20\d{2})\b", coverage)]
-    if not years:
-        return None, None
-    return min(years), max(years)
-
-
 def parse_categories(categories_str: str) -> List[Dict[str, Optional[str]]]:
     """Parse SCImago categories like 'Anthropology (Q1); Cultural Studies (Q2)'."""
     if not categories_str:
@@ -172,8 +162,7 @@ def find_existing_venue(
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     cols = (
         "id, name, type, issn, eissn, scopus_id, publisher_id, country_code, "
-        "open_access, sjr, h_index, works_count, cited_by_count, "
-        "coverage_start_year, coverage_end_year, is_indexed_in_scopus, validation_status"
+        "open_access, sjr, h_index, is_indexed_in_scopus, validation_status"
     )
     base = f"SELECT {cols} FROM venues"
 
@@ -341,8 +330,6 @@ def build_venue_updates(
     fill_if_null("scopus_id", parsed.get("scopus_id"))
     fill_if_null("publisher_id", publisher_id)
     fill_if_null("country_code", parsed.get("country_code"))
-    fill_if_null("coverage_start_year", parsed.get("coverage_start_year"))
-    fill_if_null("coverage_end_year", parsed.get("coverage_end_year"))
 
     # Metrics: update if SCImago has better/newer data
     add_if_better("sjr", parsed.get("sjr"))
@@ -355,10 +342,6 @@ def build_venue_updates(
         if old_h is None or new_h > old_h:
             updates.append("h_index = ?")
             params.append(new_h)
-
-    # works_count, cited_by_count: update if SCImago provides
-    add_if_better("works_count", parsed.get("works_count"))
-    add_if_better("cited_by_count", parsed.get("cited_by_count"))
 
     # Mark as indexed in Scopus (SCImago is a Scopus-derived ranking)
     if not existing.get("is_indexed_in_scopus"):
@@ -392,12 +375,9 @@ def process_csv_row(
     country_name = as_clean_string(row.get("Country"), 100)
     country_code = get_country_code(country_name) if country_name else None
     categories = parse_categories(row.get("Categories", ""))
-    coverage_start, coverage_end = parse_coverage_years(row.get("Coverage", ""))
 
     sjr = parse_decimal(row.get("SJR"))
     h_index = parse_int(row.get("H index"))
-    total_docs = parse_int(row.get("Total Docs. (2024)")) or parse_int(row.get("Total Docs. (3years)"))
-    total_cites = parse_int(row.get("Total Citations (3years)"))
     is_oa = 1 if (row.get("Open Access") or "").strip().lower() in ("yes", "oa") else 0
 
     parsed = {
@@ -409,11 +389,7 @@ def process_csv_row(
         "country_code": country_code,
         "sjr": sjr,
         "h_index": h_index,
-        "works_count": total_docs,
-        "cited_by_count": total_cites,
         "open_access": is_oa,
-        "coverage_start_year": coverage_start,
-        "coverage_end_year": coverage_end,
     }
 
     publisher_id = None
@@ -467,11 +443,7 @@ def process_csv_row(
             "country_code": country_code,
             "sjr": sjr,
             "h_index": h_index,
-            "works_count": total_docs,
-            "cited_by_count": total_cites,
             "open_access": is_oa,
-            "coverage_start_year": coverage_start,
-            "coverage_end_year": coverage_end,
             "is_indexed_in_scopus": 1,
             "validation_status": "VALIDATED",
         }

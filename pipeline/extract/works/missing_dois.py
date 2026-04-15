@@ -21,6 +21,7 @@ import sys
 import csv
 import os
 import logging
+from pathlib import Path
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Set, List, Dict, Optional, Tuple
@@ -37,6 +38,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 DOI_CACHE_DIR = 'works/doi/cache'
 OUTPUT_DIR = "works/doi/missing"
+WORKS_DIR = "./works"
 
 
 def choose_lookup_issn(raw_issn: Optional[str], raw_eissn: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
@@ -51,9 +53,19 @@ def choose_lookup_issn(raw_issn: Optional[str], raw_eissn: Optional[str]) -> Tup
 
 
 class DoiChecker:
-    def __init__(self, config, from_year: int = None, until_year: int = None, config_path: str = None):
+    def __init__(
+        self,
+        config,
+        from_year: int = None,
+        until_year: int = None,
+        config_path: str = None,
+        from_files: bool = False,
+        works_dir: str = WORKS_DIR,
+    ):
         self.config = config
         self.config_path = config_path
+        self.from_files = from_files
+        self.works_dir = works_dir
         self.api_email = config.get('api', 'email', fallback='anonymous@example.com')
         from pipeline.extract.http import build_user_agent
         user_agent = build_user_agent(config)
@@ -64,6 +76,8 @@ class DoiChecker:
 
         os.makedirs(DOI_CACHE_DIR, exist_ok=True)
         logging.info(f"Crossref client initialized. DOI cache at '{DOI_CACHE_DIR}'.")
+        if self.from_files:
+            logging.info(f"Existing DOI lookup mode: files under '{self.works_dir}'.")
 
     # ------------------------------------------------------------------
     # Crossref DOI fetching — results partitioned by publication year
@@ -246,6 +260,30 @@ class DoiChecker:
                 except Exception:
                     pass
 
+    @staticmethod
+    def _doi_from_filename(filename: str) -> Optional[str]:
+        """Best-effort reverse of sanitize_doi_for_filename for JSON cache names."""
+        stem = Path(filename).stem
+        if not stem.startswith("10."):
+            return None
+        doi = stem.replace("_", "/", 1).lower()
+        return doi if "/" in doi else None
+
+    def _get_file_dois(self, issn: str) -> Set[str]:
+        """Read existing DOIs from local JSON cache under ./works/{crossref,openalex}/{issn}."""
+        dois = set()
+        for source in ("crossref", "openalex"):
+            source_dir = os.path.join(self.works_dir, source, issn)
+            if not os.path.isdir(source_dir):
+                continue
+            for filename in os.listdir(source_dir):
+                if not filename.endswith(".json"):
+                    continue
+                doi = self._doi_from_filename(filename)
+                if doi:
+                    dois.add(doi)
+        return dois
+
     # ------------------------------------------------------------------
     # Main per-ISSN logic
     # ------------------------------------------------------------------
@@ -272,9 +310,14 @@ class DoiChecker:
                 return
             logging.info(f"[{issn}] Crossref: {len(crossref_dois)} DOIs")
 
-            logging.info(f"[{issn}] querying database for existing DOIs via {lookup_field}...")
-            db_dois = self._get_database_dois(issn, lookup_field=lookup_field)
-            logging.info(f"[{issn}] database: {len(db_dois)} DOIs")
+            if self.from_files:
+                logging.info(f"[{issn}] querying existing DOIs from files in {self.works_dir}...")
+                db_dois = self._get_file_dois(issn)
+                logging.info(f"[{issn}] file cache: {len(db_dois)} DOIs")
+            else:
+                logging.info(f"[{issn}] querying database for existing DOIs via {lookup_field}...")
+                db_dois = self._get_database_dois(issn, lookup_field=lookup_field)
+                logging.info(f"[{issn}] database: {len(db_dois)} DOIs")
 
             missing = crossref_dois - db_dois
 
@@ -334,6 +377,8 @@ def main():
                         help="Only consider publications up to this year.")
     parser.add_argument("--force", action="store_true",
                         help="Re-fetch from Crossref even if cache exists.")
+    parser.add_argument("--from-files", action="store_true",
+                        help="Read existing DOIs from ./works/{crossref,openalex} instead of database.")
     parser.add_argument("--config", default="config.ini",
                         help="Path to config.ini.")
     args = parser.parse_args()
@@ -434,6 +479,8 @@ def main():
         from_year=args.from_year,
         until_year=args.until_year,
         config_path=args.config,
+        from_files=args.from_files,
+        works_dir=WORKS_DIR,
     )
 
     if args.force:

@@ -318,7 +318,7 @@ def find_existing_venue(cursor: mariadb.Cursor, data: Dict[str, Any]) -> Optiona
     cols = (
         "id, name, type, issn, eissn, publisher_id, homepage_url, country_code, "
         "open_access, is_in_doaj, aggregation_type, scopus_id, openalex_id, wikidata_id, mag_id, "
-        "is_indexed_in_scopus, cited_by_count, h_index, i10_index, `2yr_mean_citedness`, validation_status"
+        "is_indexed_in_scopus, h_index, i10_index, `2yr_mean_citedness`, validation_status"
     )
     sql_base = f"SELECT {cols} FROM venues"
 
@@ -425,7 +425,6 @@ def filter_conflicting_updates(
     upd_ovr: Dict[str, Any],
     upd_fil: Dict[str, Any],
     merge_duplicates: bool,
-    prefer_db_merge_procedure: bool,
     dry_run: bool,
 ) -> bool:
     merged_any = False
@@ -448,39 +447,6 @@ def filter_conflicting_updates(
                 conflict_id,
             )
             return False
-
-        if prefer_db_merge_procedure:
-            try:
-                cursor.execute("CALL sp_merge_single_venue_pair(?, ?)", (venue_id, conflict_id))
-                try:
-                    if cursor.description:
-                        cursor.fetchall()
-                except mariadb.Error:
-                    pass
-                while cursor.nextset():
-                    try:
-                        if cursor.description:
-                            cursor.fetchall()
-                    except mariadb.Error:
-                        pass
-
-                merged_secondary_ids.add(conflict_id)
-                merged_any = True
-                log.warning(
-                    "  -> Duplicata unificada via procedure por conflito em %s: primary=%s <- secondary=%s.",
-                    conflict_field,
-                    venue_id,
-                    conflict_id,
-                )
-                return True
-            except mariadb.Error as e_merge:
-                log.error(
-                    "  -> Failed to merge duplicate via procedure (primary=%s, secondary=%s, field=%s): %s",
-                    venue_id,
-                    conflict_id,
-                    conflict_field,
-                    e_merge,
-                )
 
         try:
             merge_venues_python_fallback(cursor, venue_id, conflict_id, conflict_field)
@@ -555,7 +521,7 @@ def create_new_venue(
         try:
             if field in ['open_access','is_in_doaj','is_indexed_in_scopus']:
                 return int(bool(new))
-            elif field in ['cited_by_count','h_index','i10_index']:
+            elif field in ['h_index','i10_index']:
                 return int(new) if new is not None else None
             elif field=='2yr_mean_citedness':
                 return float(new) if new is not None else None
@@ -592,7 +558,6 @@ def create_new_venue(
     new_venue['is_indexed_in_scopus'] = prep_val(data.get('is_indexed_in_scopus'), 'is_indexed_in_scopus')
     
     summary = data.get('summary_stats') or {}
-    new_venue['cited_by_count'] = prep_val(data.get('cited_by_count'), 'cited_by_count')
     new_venue['h_index'] = prep_val(summary.get('h_index'), 'h_index')
     new_venue['i10_index'] = prep_val(summary.get('i10_index'), 'i10_index')
     new_venue['2yr_mean_citedness'] = prep_val(summary.get('2yr_mean_citedness'), '2yr_mean_citedness')
@@ -848,7 +813,7 @@ def enrich_venues(
                         try:
                             if field in ['open_access','is_in_doaj','is_indexed_in_scopus']:
                                 new = int(bool(new))
-                            elif field in ['cited_by_count','h_index','i10_index']:
+                            elif field in ['h_index','i10_index']:
                                 try: new = int(new) if new is not None else None
                                 except (ValueError, TypeError): new = None
                             elif field=='2yr_mean_citedness':
@@ -857,7 +822,7 @@ def enrich_venues(
                             elif field in ['issn', 'eissn']:
                                 new = normalize_issn(new)
 
-                            if new is not None or field in ['name','homepage_url','country_code','issn','eissn','openalex_id','wikidata_id','mag_id','publisher_id', 'cited_by_count', 'h_index', 'i10_index', '2yr_mean_citedness']:
+                            if new is not None or field in ['name','homepage_url','country_code','issn','eissn','openalex_id','wikidata_id','mag_id','publisher_id', 'h_index', 'i10_index', '2yr_mean_citedness']:
                                 target[field] = new
                         except (ValueError, TypeError) as e:
                             log.warning(f"  -> Conversion error '{orig}' campo {field} (ID {venue_id}): {e}.")
@@ -897,7 +862,6 @@ def enrich_venues(
                     if pid is not None: check_add(pid, venue.get('publisher_id'), 'publisher_id', 'fill_if_null')
 
                 summary = data.get('summary_stats') or {}
-                check_add(data.get('cited_by_count'), venue.get('cited_by_count'), 'cited_by_count', 'fill_if_null')
                 check_add(summary.get('h_index'), venue.get('h_index'), 'h_index', 'fill_if_null')
                 check_add(summary.get('i10_index'), venue.get('i10_index'), 'i10_index', 'fill_if_null')
                 check_add(summary.get('2yr_mean_citedness'), venue.get('2yr_mean_citedness'), '2yr_mean_citedness', 'fill_if_null')
@@ -913,7 +877,6 @@ def enrich_venues(
                         upd_ovr,
                         upd_fil,
                         merge_duplicates=not args.no_merge_duplicates,
-                        prefer_db_merge_procedure=args.prefer_db_merge_procedure,
                         dry_run=args.dry_run,
                     )
                     if merged_any and not args.dry_run:
@@ -1019,7 +982,6 @@ def main():
     parser.add_argument('--config', type=str, default=None, help="Path to config.ini.")
     parser.add_argument('--dry-run', action='store_true', help="Simulate without writing to DB.")
     parser.add_argument('--no-merge-duplicates', action='store_true', help="Disable auto-merge on unique constraint conflict.")
-    parser.add_argument('--prefer-db-merge-procedure', action='store_true', help="Try sp_merge_single_venue_pair before Python fallback.")
     args = parser.parse_args()
 
     conn = None

@@ -166,8 +166,6 @@ def parse_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
         "issn": normalize_issn(entry.get("prism:issn")),
         "eissn": normalize_issn(entry.get("prism:eIssn")),
         "homepage_url": extract_homepage_url(entry),
-        "coverage_start_year": parse_int(entry.get("coverageStartYear")),
-        "coverage_end_year": parse_int(entry.get("coverageEndYear")),
         "open_access": parse_bool_to_int(entry.get("openaccess")),
         "is_in_doaj": parse_bool_to_int(entry.get("openaccessArticle")),
         "citescore": extract_citescore(entry),
@@ -205,7 +203,7 @@ def find_existing_venue(
     cols = (
         "id, name, type, issn, eissn, scopus_id, publisher_id, homepage_url, "
         "aggregation_type, open_access, is_in_doaj, is_indexed_in_scopus, "
-        "coverage_start_year, coverage_end_year, citescore, sjr, snip, validation_status"
+        "citescore, sjr, snip, validation_status"
     )
     base = f"SELECT {cols} FROM venues"
 
@@ -278,27 +276,12 @@ def find_name_type_conflict_id(cursor: mariadb.Cursor, name: str, venue_type: st
     return None
 
 
-def _consume_cursor_result_sets(cursor: mariadb.Cursor) -> None:
-    try:
-        if cursor.description:
-            cursor.fetchall()
-    except mariadb.Error:
-        pass
-    while cursor.nextset():
-        try:
-            if cursor.description:
-                cursor.fetchall()
-        except mariadb.Error:
-            pass
-
-
 def attempt_merge_duplicate(
     cursor: mariadb.Cursor,
     primary_venue_id: int,
     secondary_venue_id: int,
     conflict_field: str,
     merge_duplicates: bool,
-    prefer_db_merge_procedure: bool,
     dry_run: bool,
 ) -> bool:
     if secondary_venue_id == primary_venue_id:
@@ -314,26 +297,6 @@ def attempt_merge_duplicate(
             secondary_venue_id,
         )
         return False
-
-    if prefer_db_merge_procedure:
-        try:
-            cursor.execute("CALL sp_merge_single_venue_pair(?, ?)", (primary_venue_id, secondary_venue_id))
-            _consume_cursor_result_sets(cursor)
-            log.warning(
-                "  -> Duplicata unificada via procedure por %s: primary=%s <- secondary=%s.",
-                conflict_field,
-                primary_venue_id,
-                secondary_venue_id,
-            )
-            return True
-        except mariadb.Error as e_proc:
-            log.error(
-                "  -> Failed to merge via procedure (primary=%s, secondary=%s, field=%s): %s",
-                primary_venue_id,
-                secondary_venue_id,
-                conflict_field,
-                e_proc,
-            )
 
     try:
         return merge_venues_python_fallback(cursor, primary_venue_id, secondary_venue_id, conflict_field)
@@ -499,7 +462,6 @@ def build_updates_for_existing(
     parsed: Dict[str, Any],
     publisher_id: Optional[int],
     merge_duplicates: bool,
-    prefer_db_merge_procedure: bool,
     dry_run: bool,
 ) -> Tuple[List[str], List[Any], bool]:
     updates: List[str] = []
@@ -530,7 +492,6 @@ def build_updates_for_existing(
             secondary_venue_id=conflict_id,
             conflict_field=conflict_field,
             merge_duplicates=merge_duplicates,
-            prefer_db_merge_procedure=prefer_db_merge_procedure,
             dry_run=dry_run,
         )
         if merged_ok:
@@ -600,8 +561,6 @@ def build_updates_for_existing(
     add_if_different("open_access", parsed.get("open_access"))
     add_if_different("is_in_doaj", parsed.get("is_in_doaj"))
     add_if_different("is_indexed_in_scopus", parsed.get("is_indexed_in_scopus"))
-    add_if_different("coverage_start_year", parsed.get("coverage_start_year"))
-    add_if_different("coverage_end_year", parsed.get("coverage_end_year"))
     add_if_different("citescore", parsed.get("citescore"))
     add_if_different("sjr", parsed.get("sjr"))
     add_if_different("snip", parsed.get("snip"))
@@ -632,8 +591,6 @@ def create_new_venue(
         "open_access": parsed.get("open_access"),
         "is_in_doaj": parsed.get("is_in_doaj"),
         "is_indexed_in_scopus": parsed.get("is_indexed_in_scopus"),
-        "coverage_start_year": parsed.get("coverage_start_year"),
-        "coverage_end_year": parsed.get("coverage_end_year"),
         "citescore": parsed.get("citescore"),
         "sjr": parsed.get("sjr"),
         "snip": parsed.get("snip"),
@@ -715,7 +672,6 @@ def process_scopus_venues(
     dry_run: bool,
     commit_batch: int,
     merge_duplicates: bool,
-    prefer_db_merge_procedure: bool,
     config_path: Optional[str] = None,
 ) -> Tuple[mariadb.Connection, Dict[str, int]]:
     counters = {
@@ -802,7 +758,6 @@ def process_scopus_venues(
                     parsed=parsed,
                     publisher_id=publisher_id,
                     merge_duplicates=merge_duplicates,
-                    prefer_db_merge_procedure=prefer_db_merge_procedure,
                     dry_run=dry_run,
                 )
                 # updates list always ends with "last_validated_at = ..." so real field count is len-1
@@ -912,7 +867,6 @@ def main() -> None:
     parser.add_argument("--config", type=str, default=None, help="Path to config.ini.")
     parser.add_argument("--dry-run", action="store_true", help="Simulate without writing to DB.")
     parser.add_argument("--no-merge-duplicates", action="store_true", help="Disable auto-merge on unique constraint conflict.")
-    parser.add_argument("--prefer-db-merge-procedure", action="store_true", help="Try sp_merge_single_venue_pair before Python fallback.")
     args = parser.parse_args()
 
     if not os.path.isdir(args.json_dir):
@@ -933,7 +887,6 @@ def main() -> None:
             dry_run=args.dry_run,
             commit_batch=args.commit_batch,
             merge_duplicates=not args.no_merge_duplicates,
-            prefer_db_merge_procedure=args.prefer_db_merge_procedure,
             config_path=args.config,
         )
         log.info("=== Finished: %s ===", counters)

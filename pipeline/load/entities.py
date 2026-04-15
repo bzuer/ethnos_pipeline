@@ -262,15 +262,6 @@ def _merge_venue_into(cursor: mariadb.Cursor, keep_id: int, drop_id: int) -> Non
         (keep_id, drop_id),
     )
     cursor.execute("DELETE FROM venue_subjects WHERE venue_id = ?", (drop_id,))
-    cursor.execute(
-        "INSERT INTO venue_yearly_stats (venue_id, year, works_count, oa_works_count, cited_by_count) "
-        "SELECT ?, s.year, s.works_count, s.oa_works_count, s.cited_by_count "
-        "FROM venue_yearly_stats s LEFT JOIN venue_yearly_stats p "
-        "ON p.venue_id = ? AND p.year = s.year "
-        "WHERE s.venue_id = ? AND p.venue_id IS NULL",
-        (keep_id, keep_id, drop_id),
-    )
-    cursor.execute("DELETE FROM venue_yearly_stats WHERE venue_id = ?", (drop_id,))
     cursor.execute("DELETE FROM venues WHERE id = ?", (drop_id,))
     logging.info("Venue merge: %s → %s", drop_id, keep_id)
 

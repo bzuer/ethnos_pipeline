@@ -101,7 +101,7 @@ _ALLCAPS_THRESHOLD = 0.8  # fraction of alpha chars that must be upper
 #  Dataclasses
 # ---------------------------------------------------------------------------
 
-_SHRINK_RATIO_THRESHOLD = 0.5   # reject if cleaned < 50% of original length
+_SHRINK_RATIO_THRESHOLD = 0.01   # reject if cleaned < 1% of original length
 _SHRINK_MIN_ORIGINAL_LEN = 20   # only check ratio when original is this long
 
 _SKIP = object()  # sentinel: _check_update returns this to mean "do not update"

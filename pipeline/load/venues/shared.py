@@ -146,27 +146,6 @@ def merge_venues_python_fallback(
     )
     merged_subjects = cursor.rowcount
 
-    # Aggregate yearly stats (update existing years)
-    cursor.execute(
-        "UPDATE venue_yearly_stats p "
-        "JOIN venue_yearly_stats s ON s.year = p.year AND s.venue_id = ? "
-        "SET p.works_count = COALESCE(p.works_count, 0) + COALESCE(s.works_count, 0), "
-        "    p.oa_works_count = COALESCE(p.oa_works_count, 0) + COALESCE(s.oa_works_count, 0), "
-        "    p.cited_by_count = COALESCE(p.cited_by_count, 0) + COALESCE(s.cited_by_count, 0) "
-        "WHERE p.venue_id = ?",
-        (secondary_venue_id, primary_venue_id),
-    )
-
-    # Insert missing years
-    cursor.execute(
-        "INSERT INTO venue_yearly_stats (venue_id, year, works_count, oa_works_count, cited_by_count) "
-        "SELECT ?, s.year, s.works_count, s.oa_works_count, s.cited_by_count "
-        "FROM venue_yearly_stats s "
-        "LEFT JOIN venue_yearly_stats p ON p.venue_id = ? AND p.year = s.year "
-        "WHERE s.venue_id = ? AND p.venue_id IS NULL",
-        (primary_venue_id, primary_venue_id, secondary_venue_id),
-    )
-
     # Delete secondary venue
     cursor.execute("DELETE FROM venues WHERE id = ?", (secondary_venue_id,))
     if cursor.rowcount == 0:
